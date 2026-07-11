@@ -1,0 +1,9 @@
+{
+  "action": "opened",
+  "repository": {
+    "full_name": "Franklindot04/github-webhook-monitor"
+  },
+  "sender": {
+    "login": "Franklindot04"
+  }
+}
