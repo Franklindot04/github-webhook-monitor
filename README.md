@@ -4,6 +4,11 @@ A lightweight FastAPI service for receiving, validating, and inspecting GitHub w
 
 This project is a small GitHub integration MVP built around secure webhook ingestion. It validates incoming deliveries using `X-Hub-Signature-256`, stores a capped in-memory list of recent events, and exposes simple endpoints for health checks and event inspection. The core focus is secure webhook validation and lightweight event visibility.
 
+## Live project page
+
+GitHub Pages:
+https://franklindot04.github.io/github-webhook-monitor/
+
 ## Features
 
 - Receive GitHub webhook deliveries via `POST /webhook/github`.
