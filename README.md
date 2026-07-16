@@ -182,7 +182,11 @@ This repository includes additional project health and governance files:
 
 ## Current status
 
-This is the initial MVP release of the project. The current implementation focuses on secure webhook ingestion, event validation, and lightweight event visibility rather than persistence, retries, or deployment automation.
+This project is currently in its initial MVP stage and serves as the foundation for future development.
+
+The current implementation focuses on secure webhook ingestion, event validation, and lightweight event visibility rather than persistence, retries, background processing, or deployment automation.
+
+More stages, hardening steps, and deployment improvements will be added in later iterations.
 
 ## License
 
