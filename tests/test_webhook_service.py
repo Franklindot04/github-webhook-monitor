@@ -28,10 +28,12 @@ def test_webhook_service_stores_event_without_http_request():
         signature=signature_for(payload),
         github_event="pull_request",
         github_delivery="delivery-001",
+        github_hook_id="12345",
     )
 
     assert event.to_dict()["event"] == "pull_request"
     assert event.to_dict()["delivery_id"] == "delivery-001"
+    assert event.to_dict()["hook_id"] == "12345"
     assert event.to_dict()["repository"] == "octo/example"
     assert event.to_dict()["sender"] == "octocat"
     assert event.to_dict()["action"] == "opened"
@@ -48,6 +50,7 @@ def test_webhook_service_rejects_invalid_signature_without_storing_event():
             signature="sha256=bad",
             github_event="pull_request",
             github_delivery="delivery-001",
+            github_hook_id="12345",
         )
 
     assert store.list_recent() == []
@@ -64,6 +67,7 @@ def test_webhook_service_rejects_malformed_json_without_storing_event():
             signature=signature_for(payload),
             github_event="pull_request",
             github_delivery="delivery-001",
+            github_hook_id="12345",
         )
 
     assert store.list_recent() == []

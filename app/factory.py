@@ -21,5 +21,11 @@ def create_app(
     app.state.settings = app_settings
     app.state.event_store = app_event_store
     app.state.webhook_service = app_webhook_service
-    app.include_router(create_router(app_webhook_service, app_event_store))
+    app.include_router(
+        create_router(
+            app_webhook_service,
+            app_event_store,
+            max_webhook_body_bytes=app_settings.max_webhook_body_bytes,
+        )
+    )
     return app

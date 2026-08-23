@@ -12,7 +12,10 @@ https://franklindot04.github.io/github-webhook-monitor/
 ## Features
 
 - Receive GitHub webhook deliveries via `POST /webhook/github`.
+- Accept GitHub webhook payloads sent as `application/json`.
 - Validate incoming webhook signatures using HMAC SHA256 and `X-Hub-Signature-256`.
+- Require GitHub delivery metadata such as event name, delivery ID, and hook ID.
+- Reject unsupported media types, oversized payloads, and invalid delivery metadata before ingestion.
 - Reject invalid deliveries with `401 Unauthorized`.
 - Store a capped in-memory list of recent events for quick inspection.
 - Expose a health endpoint for smoke checks.
@@ -24,10 +27,14 @@ https://franklindot04.github.io/github-webhook-monitor/
 github-webhook-monitor/
 ├── app/
 │   ├── __init__.py
+│   ├── api/
 │   ├── config.py
+│   ├── domain/
+│   ├── factory.py
 │   ├── main.py
 │   ├── security.py
-│   └── store.py
+│   ├── services/
+│   └── storage/
 ├── .env.example
 ├── .gitignore
 ├── CODE_OF_CONDUCT.md
@@ -73,6 +80,7 @@ github-webhook-monitor/
    ```env
    WEBHOOK_SECRET=replace-with-a-long-random-development-secret
    MAX_EVENTS=50
+   MAX_WEBHOOK_BODY_BYTES=26214400
    ```
 
 ## Tech stack
@@ -129,10 +137,10 @@ Generate a valid signature and send the request:
 SIG=$(uv run --locked python - <<'PY'
 import hmac
 import hashlib
-from app.config import settings
+from app.config import Settings
 
 payload = open("payload.json", "rb").read()
-secret = settings.webhook_secret.get_secret_value()
+secret = Settings().webhook_secret.get_secret_value()
 print("sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest())
 PY
 )
@@ -141,6 +149,7 @@ curl -X POST http://127.0.0.1:8000/webhook/github \
   -H "Content-Type: application/json" \
   -H "X-GitHub-Event: pull_request" \
   -H "X-GitHub-Delivery: test-delivery-001" \
+  -H "X-GitHub-Hook-ID: 12345" \
   -H "X-Hub-Signature-256: $SIG" \
   --data-binary @payload.json
 ```
@@ -174,6 +183,9 @@ If you are testing locally, you can expose your development server with a tunnel
 
 - Never commit your real `.env` file.
 - Keep `WEBHOOK_SECRET` private.
+- Configure GitHub webhooks with `application/json` payloads.
+- The receiver validates `X-Hub-Signature-256`; the legacy SHA-1 signature header is not accepted as a substitute.
+- `MAX_WEBHOOK_BODY_BYTES` bounds accepted request bodies and defaults to `26214400` bytes.
 - Validate the signature before processing any payload.
 - Reject invalid deliveries immediately.
 - Avoid placing secrets or credentials in the payload URL.
