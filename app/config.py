@@ -18,6 +18,3 @@ class Settings(BaseSettings):
 
     webhook_secret: SecretStr = Field(min_length=1)
     max_events: PositiveInt = 50
-
-
-settings = Settings()

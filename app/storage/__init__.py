@@ -1,0 +1,1 @@
+"""Storage contracts and adapters."""
