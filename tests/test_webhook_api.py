@@ -6,8 +6,9 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main
-from app.store import events_store
+from app.config import Settings
+from app.factory import create_app
+from app.storage.events import InMemoryEventStore
 
 
 TEST_SECRET = "test-webhook-secret"
@@ -21,16 +22,15 @@ def signature_for(payload: bytes, secret: str = TEST_SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
-@pytest.fixture(autouse=True)
-def isolated_app_state():
-    events_store.clear()
-    yield
-    events_store.clear()
+@pytest.fixture
+def event_store():
+    return InMemoryEventStore(max_events=50)
 
 
 @pytest.fixture
-def client():
-    return TestClient(main.app)
+def client(event_store):
+    settings = Settings(webhook_secret=TEST_SECRET, max_events=event_store.max_events, _env_file=None)
+    return TestClient(create_app(settings=settings, event_store=event_store))
 
 
 def post_webhook(client: TestClient, payload: bytes, headers: dict[str, str] | None = None):
@@ -52,7 +52,7 @@ def test_health_endpoint_contract(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_valid_signed_webhook_stores_and_returns_event_metadata(client):
+def test_valid_signed_webhook_stores_and_returns_event_metadata(client, event_store):
     payload = encode_json(
         {
             "action": "opened",
@@ -75,31 +75,32 @@ def test_valid_signed_webhook_stores_and_returns_event_metadata(client):
     assert event["sender"] == "octocat"
     assert datetime.fromisoformat(event["received_at"]).tzinfo is not None
 
-    assert len(events_store) == 1
-    assert events_store[0] == event
+    stored_events = [stored_event.to_dict() for stored_event in event_store.list_recent()]
+    assert len(stored_events) == 1
+    assert stored_events[0] == event
 
 
-def test_webhook_missing_signature_returns_current_unauthorized_behavior(client):
+def test_webhook_missing_signature_returns_current_unauthorized_behavior(client, event_store):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": ""})
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid webhook signature"}
-    assert len(events_store) == 0
+    assert event_store.list_recent() == []
 
 
-def test_webhook_invalid_signature_returns_current_unauthorized_behavior(client):
+def test_webhook_invalid_signature_returns_current_unauthorized_behavior(client, event_store):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": "sha256=bad"})
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid webhook signature"}
-    assert len(events_store) == 0
+    assert event_store.list_recent() == []
 
 
-def test_webhook_signature_for_different_payload_is_rejected(client):
+def test_webhook_signature_for_different_payload_is_rejected(client, event_store):
     signed_payload = encode_json({"action": "opened"})
     transmitted_payload = encode_json({"action": "closed"})
 
@@ -110,17 +111,17 @@ def test_webhook_signature_for_different_payload_is_rejected(client):
     )
 
     assert response.status_code == 401
-    assert len(events_store) == 0
+    assert event_store.list_recent() == []
 
 
-def test_malformed_json_with_valid_signature_returns_current_bad_request_behavior(client):
+def test_malformed_json_with_valid_signature_returns_current_bad_request_behavior(client, event_store):
     payload = b'{"action":'
 
     response = post_webhook(client, payload)
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid JSON payload"}
-    assert len(events_store) == 0
+    assert event_store.list_recent() == []
 
 
 def test_webhook_ingestion_uses_most_recent_first_ordering(client):
@@ -162,8 +163,8 @@ def test_events_endpoint_exposes_current_in_memory_collection(client):
     assert events_response.json() == {"count": 1, "events": [webhook_response.json()["event"]]}
 
 
-def test_event_store_respects_configured_maximum_length(client):
-    for index in range(events_store.maxlen + 1):
+def test_event_store_respects_configured_maximum_length(client, event_store):
+    for index in range(event_store.max_events + 1):
         payload = encode_json({"action": f"event-{index}"})
         response = post_webhook(
             client,
@@ -175,9 +176,10 @@ def test_event_store_respects_configured_maximum_length(client):
         )
         assert response.status_code == 200
 
-    assert len(events_store) == events_store.maxlen
-    assert events_store[0]["delivery_id"] == f"delivery-{events_store.maxlen:03d}"
-    assert events_store[-1]["delivery_id"] == "delivery-001"
+    stored_events = [event.to_dict() for event in event_store.list_recent()]
+    assert len(stored_events) == event_store.max_events
+    assert stored_events[0]["delivery_id"] == f"delivery-{event_store.max_events:03d}"
+    assert stored_events[-1]["delivery_id"] == "delivery-001"
 
 
 def test_absent_event_and_delivery_headers_are_stored_as_null(client):
