@@ -35,13 +35,14 @@ github-webhook-monitor/
 ├── LICENSE
 ├── NOTICE
 ├── SECURITY.md
-└── requirements.txt
+├── pyproject.toml
+└── uv.lock
 ```
 
 ## Requirements
 
 - Python 3.12+
-- pip
+- uv
 - GitHub repository access for webhook setup
 - A webhook secret stored in environment variables
 
@@ -53,15 +54,14 @@ github-webhook-monitor/
    cd github-webhook-monitor
    ```
 
-2. Create and activate a virtual environment:
+2. Install `uv` if it is not already available:
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate
+   python -m pip install uv
    ```
 
-3. Install dependencies:
+3. Synchronize the locked project environment:
    ```bash
-   pip install -r requirements.txt
+   uv sync --locked --group dev
    ```
 
 4. Create your environment file:
@@ -71,9 +71,7 @@ github-webhook-monitor/
 
 5. Update `.env` with your values:
    ```env
-   WEBHOOK_SECRET=replace-with-a-random-secret
-   APP_HOST=0.0.0.0
-   APP_PORT=8000
+   WEBHOOK_SECRET=replace-with-a-long-random-development-secret
    MAX_EVENTS=50
    ```
 
@@ -82,14 +80,15 @@ github-webhook-monitor/
 - Python
 - FastAPI
 - Uvicorn
-- python-dotenv
+- pydantic-settings
+- uv
 
 ## Running the app
 
 Start the development server with Uvicorn:
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv run --locked uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Once the server is running, you can open:
@@ -127,13 +126,14 @@ Example payload file:
 Generate a valid signature and send the request:
 
 ```bash
-SIG=$(python - <<'PY'
+SIG=$(uv run --locked python - <<'PY'
 import hmac
 import hashlib
-from app.config import WEBHOOK_SECRET
+from app.config import settings
 
 payload = open("payload.json", "rb").read()
-print("sha256=" + hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest())
+secret = settings.webhook_secret.get_secret_value()
+print("sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest())
 PY
 )
 
@@ -143,6 +143,14 @@ curl -X POST http://127.0.0.1:8000/webhook/github \
   -H "X-GitHub-Delivery: test-delivery-001" \
   -H "X-Hub-Signature-256: $SIG" \
   --data-binary @payload.json
+```
+
+## Running tests
+
+Run the regression suite through the locked project environment:
+
+```bash
+uv run --locked pytest -q
 ```
 
 ## GitHub webhook setup

@@ -1,0 +1,22 @@
+[project]
+name = "github-webhook-monitor"
+version = "0.2.0"
+description = "A lightweight FastAPI service for receiving, validating, and inspecting GitHub webhook deliveries."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "fastapi>=0.141,<1.0",
+    "pydantic-settings>=2.12,<3.0",
+    "uvicorn>=0.52,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.12,<3.0",
+    "pytest>=9.1,<10.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
