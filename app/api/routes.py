@@ -5,7 +5,7 @@ from app.services.webhooks import (
     MalformedWebhookPayloadError,
     WebhookIngestionService,
 )
-from app.storage.events import EventStore
+from app.storage.deliveries import DeliveryStore
 
 
 async def read_bounded_body(request: Request, max_body_bytes: int) -> bytes:
@@ -77,7 +77,7 @@ def validate_installation_target(
 
 def create_router(
     webhook_service: WebhookIngestionService,
-    event_store: EventStore,
+    delivery_store: DeliveryStore,
     max_webhook_body_bytes: int,
 ) -> APIRouter:
     router = APIRouter()
@@ -88,7 +88,7 @@ def create_router(
 
     @router.get("/events")
     def get_events():
-        events = [event.to_dict() for event in event_store.list_recent()]
+        events = [event.to_dict() for event in delivery_store.list_recent()]
         return {"count": len(events), "events": events}
 
     @router.post("/webhook/github")
