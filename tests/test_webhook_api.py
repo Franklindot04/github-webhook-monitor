@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from app.api.routes import is_json_content_type, read_bounded_body, validate_content_length
 from app.config import Settings
 from app.factory import create_app
-from app.storage.events import InMemoryEventStore
+from app.storage.deliveries import InMemoryDeliveryStore
 
 
 TEST_SECRET = "test-webhook-secret"
@@ -27,19 +27,19 @@ def signature_for(payload: bytes, secret: str = TEST_SECRET) -> str:
 
 
 @pytest.fixture
-def event_store():
-    return InMemoryEventStore(max_events=50)
+def delivery_store():
+    return InMemoryDeliveryStore(max_events=50)
 
 
 @pytest.fixture
-def client(event_store):
+def client(delivery_store):
     settings = Settings(
         webhook_secret=TEST_SECRET,
-        max_events=event_store.max_events,
+        max_events=delivery_store.max_events,
         max_webhook_body_bytes=4096,
         _env_file=None,
     )
-    return TestClient(create_app(settings=settings, event_store=event_store))
+    return TestClient(create_app(settings=settings, delivery_store=delivery_store))
 
 
 def post_webhook(client: TestClient, payload: bytes, headers: dict[str, str] | None = None):
@@ -62,7 +62,7 @@ def test_health_endpoint_contract(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_valid_signed_webhook_stores_and_returns_event_metadata(client, event_store):
+def test_valid_signed_webhook_stores_and_returns_event_metadata(client, delivery_store):
     payload = encode_json(
         {
             "action": "opened",
@@ -78,42 +78,44 @@ def test_valid_signed_webhook_stores_and_returns_event_metadata(client, event_st
     assert body["message"] == "Webhook received"
 
     event = body["event"]
+    assert event["attempt_id"]
     assert event["event"] == "pull_request"
     assert event["delivery_id"] == "delivery-001"
     assert event["hook_id"] == "12345"
     assert event["installation_target_id"] is None
     assert event["installation_target_type"] is None
+    assert event["payload_sha256"] == hashlib.sha256(payload).hexdigest()
     assert event["action"] == "opened"
     assert event["repository"] == "octo/example"
     assert event["sender"] == "octocat"
     assert datetime.fromisoformat(event["received_at"]).tzinfo is not None
 
-    stored_events = [stored_event.to_dict() for stored_event in event_store.list_recent()]
+    stored_events = [stored_event.to_dict() for stored_event in delivery_store.list_recent()]
     assert len(stored_events) == 1
     assert stored_events[0] == event
 
 
-def test_webhook_missing_signature_returns_current_unauthorized_behavior(client, event_store):
+def test_webhook_missing_signature_returns_current_unauthorized_behavior(client, delivery_store):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": ""})
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid webhook signature"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_webhook_invalid_signature_returns_current_unauthorized_behavior(client, event_store):
+def test_webhook_invalid_signature_returns_current_unauthorized_behavior(client, delivery_store):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": "sha256=bad"})
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid webhook signature"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_webhook_signature_for_different_payload_is_rejected(client, event_store):
+def test_webhook_signature_for_different_payload_is_rejected(client, delivery_store):
     signed_payload = encode_json({"action": "opened"})
     transmitted_payload = encode_json({"action": "closed"})
 
@@ -124,17 +126,17 @@ def test_webhook_signature_for_different_payload_is_rejected(client, event_store
     )
 
     assert response.status_code == 401
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_malformed_json_with_valid_signature_returns_current_bad_request_behavior(client, event_store):
+def test_malformed_json_with_valid_signature_returns_current_bad_request_behavior(client, delivery_store):
     payload = b'{"action":'
 
     response = post_webhook(client, payload)
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid JSON payload"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
 def test_application_json_with_charset_parameter_is_accepted(client):
@@ -153,7 +155,7 @@ def test_application_json_with_charset_parameter_is_accepted(client):
 
 
 @pytest.mark.parametrize("content_type", [None, "application/x-www-form-urlencoded", "text/plain"])
-def test_unsupported_or_missing_content_type_is_rejected(client, event_store, content_type):
+def test_unsupported_or_missing_content_type_is_rejected(client, delivery_store, content_type):
     payload = encode_json({"action": "opened"})
     headers = {
         "X-GitHub-Event": "pull_request",
@@ -168,7 +170,7 @@ def test_unsupported_or_missing_content_type_is_rejected(client, event_store, co
 
     assert response.status_code == 415
     assert response.json() == {"detail": "Unsupported media type"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
 @pytest.mark.parametrize(
@@ -187,7 +189,7 @@ def test_unsupported_or_missing_content_type_is_rejected(client, event_store, co
 )
 def test_required_github_delivery_headers_are_validated(
     client,
-    event_store,
+    delivery_store,
     header_name,
     header_value,
     detail,
@@ -209,10 +211,10 @@ def test_required_github_delivery_headers_are_validated(
 
     assert response.status_code == 400
     assert response.json() == {"detail": detail}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_legacy_sha1_signature_header_alone_is_insufficient(client, event_store):
+def test_legacy_sha1_signature_header_alone_is_insufficient(client, delivery_store):
     payload = encode_json({"action": "opened"})
     legacy_signature = "sha1=" + hmac.new(TEST_SECRET.encode("utf-8"), payload, hashlib.sha1).hexdigest()
 
@@ -229,12 +231,12 @@ def test_legacy_sha1_signature_header_alone_is_insufficient(client, event_store)
     )
 
     assert response.status_code == 401
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_payload_at_configured_limit_is_accepted(event_store):
+def test_payload_at_configured_limit_is_accepted(delivery_store):
     settings = Settings(webhook_secret=TEST_SECRET, max_webhook_body_bytes=13, _env_file=None)
-    client = TestClient(create_app(settings=settings, event_store=event_store))
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
     payload = b'{"a":"12345"}'
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": signature_for(payload)})
@@ -243,9 +245,9 @@ def test_payload_at_configured_limit_is_accepted(event_store):
     assert response.status_code == 200
 
 
-def test_payload_below_configured_limit_is_accepted(event_store):
+def test_payload_below_configured_limit_is_accepted(delivery_store):
     settings = Settings(webhook_secret=TEST_SECRET, max_webhook_body_bytes=14, _env_file=None)
-    client = TestClient(create_app(settings=settings, event_store=event_store))
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
     payload = b'{"a":"12345"}'
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": signature_for(payload)})
@@ -253,19 +255,19 @@ def test_payload_below_configured_limit_is_accepted(event_store):
     assert response.status_code == 200
 
 
-def test_payload_above_configured_limit_is_rejected_without_storing(event_store):
+def test_payload_above_configured_limit_is_rejected_without_storing(delivery_store):
     settings = Settings(webhook_secret=TEST_SECRET, max_webhook_body_bytes=12, _env_file=None)
-    client = TestClient(create_app(settings=settings, event_store=event_store))
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
     payload = b'{"a":"12345"}'
 
     response = post_webhook(client, payload, {"X-Hub-Signature-256": signature_for(payload)})
 
     assert response.status_code == 413
     assert response.json() == {"detail": "Payload too large"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
-def test_oversized_declared_content_length_is_rejected_before_body_processing(client, event_store):
+def test_oversized_declared_content_length_is_rejected_before_body_processing(client, delivery_store):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(
@@ -275,11 +277,11 @@ def test_oversized_declared_content_length_is_rejected_before_body_processing(cl
     )
 
     assert response.status_code == 413
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
 @pytest.mark.parametrize("content_length", ["not-a-number", "-1", " -1 "])
-def test_invalid_declared_content_length_is_rejected_by_route(client, event_store, content_length):
+def test_invalid_declared_content_length_is_rejected_by_route(client, delivery_store, content_length):
     payload = encode_json({"action": "opened"})
 
     response = post_webhook(
@@ -290,7 +292,7 @@ def test_invalid_declared_content_length_is_rejected_by_route(client, event_stor
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid Content-Length"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
 @pytest.mark.parametrize("content_length", ["not-a-number", "-1", " -1 "])
@@ -372,8 +374,8 @@ def test_events_endpoint_exposes_current_in_memory_collection(client):
     assert events_response.json() == {"count": 1, "events": [webhook_response.json()["event"]]}
 
 
-def test_event_store_respects_configured_maximum_length(client, event_store):
-    for index in range(event_store.max_events + 1):
+def test_delivery_store_respects_configured_maximum_length(client, delivery_store):
+    for index in range(delivery_store.max_events + 1):
         payload = encode_json({"action": f"event-{index}"})
         response = post_webhook(
             client,
@@ -385,9 +387,9 @@ def test_event_store_respects_configured_maximum_length(client, event_store):
         )
         assert response.status_code == 200
 
-    stored_events = [event.to_dict() for event in event_store.list_recent()]
-    assert len(stored_events) == event_store.max_events
-    assert stored_events[0]["delivery_id"] == f"delivery-{event_store.max_events:03d}"
+    stored_events = [event.to_dict() for event in delivery_store.list_recent()]
+    assert len(stored_events) == delivery_store.max_events
+    assert stored_events[0]["delivery_id"] == f"delivery-{delivery_store.max_events:03d}"
     assert stored_events[-1]["delivery_id"] == "delivery-001"
 
 
@@ -455,7 +457,7 @@ def test_hook_id_and_installation_target_metadata_are_captured(client):
         {"X-GitHub-Hook-Installation-Target-Type": "repository"},
     ],
 )
-def test_invalid_installation_target_metadata_is_rejected(client, event_store, headers):
+def test_invalid_installation_target_metadata_is_rejected(client, delivery_store, headers):
     payload = encode_json({"action": "opened"})
     headers["X-Hub-Signature-256"] = signature_for(payload)
 
@@ -463,7 +465,7 @@ def test_invalid_installation_target_metadata_is_rejected(client, event_store, h
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid GitHub installation target metadata"}
-    assert event_store.list_recent() == []
+    assert delivery_store.list_recent() == []
 
 
 def test_empty_json_object_is_accepted_with_null_extracted_metadata(client):
@@ -504,10 +506,61 @@ def test_duplicate_delivery_id_is_not_rejected_during_stage_4(client):
 
     assert first_response.status_code == 200
     assert second_response.status_code == 200
-    assert [event["delivery_id"] for event in client.get("/events").json()["events"]] == [
+    events = client.get("/events").json()["events"]
+    assert [event["delivery_id"] for event in events] == [
         "same-delivery-id",
         "same-delivery-id",
     ]
+    assert events[0]["attempt_id"] != events[1]["attempt_id"]
+
+
+def test_same_delivery_id_with_different_payloads_keeps_distinct_attempt_digests(client):
+    first_payload = encode_json({"action": "opened"})
+    second_payload = encode_json({"action": "closed"})
+    delivery_headers = {"X-GitHub-Delivery": "same-delivery-id"}
+
+    first_response = post_webhook(
+        client,
+        first_payload,
+        {**delivery_headers, "X-Hub-Signature-256": signature_for(first_payload)},
+    )
+    second_response = post_webhook(
+        client,
+        second_payload,
+        {**delivery_headers, "X-Hub-Signature-256": signature_for(second_payload)},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    events = client.get("/events").json()["events"]
+    assert events[0]["delivery_id"] == events[1]["delivery_id"] == "same-delivery-id"
+    assert events[0]["attempt_id"] != events[1]["attempt_id"]
+    assert events[0]["payload_sha256"] == hashlib.sha256(second_payload).hexdigest()
+    assert events[1]["payload_sha256"] == hashlib.sha256(first_payload).hexdigest()
+    assert events[0]["payload_sha256"] != events[1]["payload_sha256"]
+
+
+def test_attempt_based_capacity_does_not_keep_unbounded_history():
+    settings = Settings(webhook_secret=TEST_SECRET, max_events=2, _env_file=None)
+    delivery_store = InMemoryDeliveryStore(max_events=2)
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    for delivery_id, action in [
+        ("delivery-a", "first"),
+        ("delivery-a", "second"),
+        ("delivery-b", "third"),
+    ]:
+        payload = encode_json({"action": action})
+        response = post_webhook(
+            client,
+            payload,
+            {"X-GitHub-Delivery": delivery_id, "X-Hub-Signature-256": signature_for(payload)},
+        )
+        assert response.status_code == 200
+
+    events = client.get("/events").json()["events"]
+    assert [event["action"] for event in events] == ["third", "second"]
+    assert [event["delivery_id"] for event in events] == ["delivery-b", "delivery-a"]
 
 
 def test_unicode_repository_and_sender_values_are_extracted(client):

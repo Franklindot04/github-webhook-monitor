@@ -2,7 +2,7 @@
 
 A lightweight FastAPI service for receiving, validating, and inspecting GitHub webhook deliveries.
 
-This project is a small GitHub integration MVP built around secure webhook ingestion. It validates incoming deliveries using `X-Hub-Signature-256`, stores a capped in-memory list of recent events, and exposes simple endpoints for health checks and event inspection. The core focus is secure webhook validation and lightweight event visibility.
+This project is a small GitHub integration MVP built around secure webhook ingestion. It validates incoming deliveries using `X-Hub-Signature-256`, stores a capped in-memory ledger of recent observed delivery attempts, and exposes simple endpoints for health checks and event inspection. The core focus is secure webhook validation and lightweight delivery visibility.
 
 ## Live project page
 
@@ -17,7 +17,7 @@ https://franklindot04.github.io/github-webhook-monitor/
 - Require GitHub delivery metadata such as event name, delivery ID, and hook ID.
 - Reject unsupported media types, oversized payloads, and invalid delivery metadata before ingestion.
 - Reject invalid deliveries with `401 Unauthorized`.
-- Store a capped in-memory list of recent events for quick inspection.
+- Store a capped in-memory ledger of recent observed delivery attempts for quick inspection.
 - Expose a health endpoint for smoke checks.
 - Expose an events endpoint for viewing recently received payload summaries.
 
@@ -110,7 +110,7 @@ Once the server is running, you can open:
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/health` | Health check endpoint |
-| GET | `/events` | Returns recent stored webhook event summaries |
+| GET | `/events` | Returns recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
 ## Local webhook test
@@ -189,6 +189,18 @@ If you are testing locally, you can expose your development server with a tunnel
 - Validate the signature before processing any payload.
 - Reject invalid deliveries immediately.
 - Avoid placing secrets or credentials in the payload URL.
+
+## Delivery ledger model
+
+GitHub's `X-GitHub-Delivery` value identifies the logical upstream delivery. This receiver assigns a separate application-owned attempt ID to each accepted receipt it observes.
+
+Repeated GitHub delivery IDs are retained as separate observed attempts rather than rejected or classified immediately. The in-memory ledger keeps bounded recent attempt metadata, including a SHA-256 digest of the exact accepted payload bytes, but it does not retain full raw payload bodies long term.
+
+`MAX_EVENTS` keeps its existing operator-facing name and now bounds the number of recent observed delivery attempts retained by the in-memory ledger.
+
+The `/events` endpoint remains available and preserves the existing event fields. It also includes additive attempt metadata such as `attempt_id` and `payload_sha256` for operational comparison.
+
+Replay detection, redelivery classification, idempotency, and durable payload retention are deferred until a persistence model exists.
 
 ## Repository files
 

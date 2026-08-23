@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
+import hashlib
 import json
+from typing import Callable
+from uuid import UUID, uuid4
 
-from app.domain.events import EventSummary
+from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
 from app.security import verify_github_signature
-from app.storage.events import EventStore
+from app.storage.deliveries import DeliveryStore
 
 
 class InvalidWebhookSignatureError(Exception):
@@ -15,9 +18,17 @@ class MalformedWebhookPayloadError(Exception):
 
 
 class WebhookIngestionService:
-    def __init__(self, event_store: EventStore, webhook_secret: str):
-        self._event_store = event_store
+    def __init__(
+        self,
+        delivery_store: DeliveryStore,
+        webhook_secret: str,
+        attempt_id_factory: Callable[[], UUID] = uuid4,
+        clock: Callable[[], datetime] | None = None,
+    ):
+        self._delivery_store = delivery_store
         self._webhook_secret = webhook_secret
+        self._attempt_id_factory = attempt_id_factory
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def ingest(
         self,
@@ -28,7 +39,7 @@ class WebhookIngestionService:
         github_hook_id: str,
         installation_target_id: str | None = None,
         installation_target_type: str | None = None,
-    ) -> EventSummary:
+    ) -> DeliveryAttempt:
         if not verify_github_signature(raw_body, signature, self._webhook_secret):
             raise InvalidWebhookSignatureError
 
@@ -42,16 +53,21 @@ class WebhookIngestionService:
         repository = payload.get("repository")
         sender = payload.get("sender")
 
-        event = EventSummary(
-            received_at=datetime.now(timezone.utc).isoformat(),
-            event=github_event,
-            delivery_id=github_delivery,
-            hook_id=github_hook_id,
+        delivery_identity = GitHubDeliveryIdentity(
+            delivery_guid=github_delivery,
+            hook_id=int(github_hook_id),
+        )
+        attempt = DeliveryAttempt(
+            attempt_id=self._attempt_id_factory(),
+            delivery_identity=delivery_identity,
+            received_at=self._clock(),
+            payload_sha256=hashlib.sha256(raw_body).hexdigest(),
+            event_type=github_event,
             installation_target_id=installation_target_id,
             installation_target_type=installation_target_type,
             repository=repository.get("full_name") if isinstance(repository, dict) else None,
             sender=sender.get("login") if isinstance(sender, dict) else None,
             action=payload.get("action"),
         )
-        self._event_store.add(event)
-        return event
+        self._delivery_store.add(attempt)
+        return attempt
