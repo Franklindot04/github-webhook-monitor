@@ -21,7 +21,13 @@ def test_independently_constructed_apps_do_not_share_events():
     response = first_client.post(
         "/webhook/github",
         content=payload,
-        headers={"X-Hub-Signature-256": signature_for(payload, secret)},
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "delivery-001",
+            "X-GitHub-Hook-ID": "12345",
+            "X-Hub-Signature-256": signature_for(payload, secret),
+        },
     )
 
     assert response.status_code == 200
@@ -48,6 +54,9 @@ def test_create_app_uses_custom_settings_capacity():
             content=payload,
             headers={
                 "X-GitHub-Delivery": f"delivery-{index}",
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Hook-ID": "12345",
+                "Content-Type": "application/json",
                 "X-Hub-Signature-256": signature_for(payload, "synthetic-secret"),
             },
         )
@@ -70,6 +79,9 @@ def test_injected_event_store_is_used_for_ingestion_and_listing():
         content=payload,
         headers={
             "X-GitHub-Delivery": "delivery-001",
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Hook-ID": "12345",
+            "Content-Type": "application/json",
             "X-Hub-Signature-256": signature_for(payload, secret),
         },
     )

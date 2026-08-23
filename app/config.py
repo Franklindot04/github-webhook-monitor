@@ -18,3 +18,4 @@ class Settings(BaseSettings):
 
     webhook_secret: SecretStr = Field(min_length=1)
     max_events: PositiveInt = 50
+    max_webhook_body_bytes: PositiveInt = 26_214_400

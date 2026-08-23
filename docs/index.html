@@ -100,7 +100,10 @@
       <h2>What it does</h2>
       <ul>
         <li>Receives GitHub webhook deliveries via <code>POST /webhook/github</code>.</li>
+        <li>Accepts webhook payloads sent as <code>application/json</code>.</li>
         <li>Validates signatures using HMAC SHA256 and <code>X-Hub-Signature-256</code>.</li>
+        <li>Requires event, delivery, and hook metadata from GitHub delivery headers.</li>
+        <li>Rejects unsupported media types, oversized payloads, and invalid delivery metadata.</li>
         <li>Rejects invalid deliveries with <code>401 Unauthorized</code>.</li>
         <li>Stores a capped in-memory list of recent events for inspection.</li>
         <li>Exposes <code>GET /health</code> and <code>GET /events</code> endpoints.</li>
@@ -125,6 +128,7 @@ uv run --locked uvicorn app.main:app --reload --host 0.0.0.0 --port 8000</code><
         <li>Payload URL: <code>https://your-domain.com/webhook/github</code></li>
         <li>Content type: <code>application/json</code></li>
         <li>Secret: same as <code>WEBHOOK_SECRET</code> in your <code>.env</code></li>
+        <li>Payload size limit: configure <code>MAX_WEBHOOK_BODY_BYTES</code> if the default <code>26214400</code> byte ceiling needs adjustment.</li>
         <li>Events: start with <strong>Pull requests</strong> or <strong>Just the push event</strong>.</li>
       </ul>
       <p>For local testing, expose your dev server with a tunnel (e.g. ngrok) and use the public URL as the payload URL.</p>
