@@ -162,6 +162,13 @@ Run the regression suite through the locked project environment:
 uv run --locked pytest -q
 ```
 
+PostgreSQL integration tests are skipped unless an explicit disposable test database is provided:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://example_user:example_password@example-host:5432/example_database \
+uv run --locked pytest -q -m integration
+```
+
 ## GitHub webhook setup
 
 To connect this service to a repository webhook:
@@ -201,6 +208,21 @@ Repeated GitHub delivery IDs are retained as separate observed attempts rather t
 The `/events` endpoint remains available and preserves the existing event fields. It also includes additive attempt metadata such as `attempt_id` and `payload_sha256` for operational comparison.
 
 Replay detection, redelivery classification, idempotency, and durable payload retention are deferred until a persistence model exists.
+
+## PostgreSQL persistence foundation
+
+The project includes a PostgreSQL delivery-store adapter and Alembic migration foundation. The application still defaults to the in-memory delivery ledger; PostgreSQL is not selected automatically at runtime yet.
+
+Migration and database tooling use `DATABASE_URL` with the `postgresql+psycopg://` driver form:
+
+```bash
+DATABASE_URL=postgresql+psycopg://example_user:example_password@example-host:5432/example_database \
+uv run --locked alembic upgrade head
+```
+
+The PostgreSQL schema stores logical GitHub deliveries separately from observed delivery attempts. It persists attempt metadata and `payload_sha256`, but it does not persist full raw webhook request bodies.
+
+`MAX_EVENTS` continues to bound only the current in-memory recent-attempt window. Durable PostgreSQL retention policy and runtime database selection are deferred to later stages.
 
 ## Repository files
 

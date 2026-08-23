@@ -70,6 +70,22 @@ def test_environment_variable_loading(monkeypatch):
     assert settings.max_webhook_body_bytes == 2048
 
 
+def test_database_url_environment_variable_coexists_with_application_settings(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_SECRET", "synthetic-env-secret")
+    monkeypatch.setenv("MAX_EVENTS", "12")
+    monkeypatch.setenv("MAX_WEBHOOK_BODY_BYTES", "2048")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.webhook_secret.get_secret_value() == "synthetic-env-secret"
+    assert settings.max_events == 12
+    assert settings.max_webhook_body_bytes == 2048
+
+
 @pytest.mark.parametrize("max_webhook_body_bytes", [0, -1])
 def test_invalid_max_webhook_body_bytes_values_are_rejected(max_webhook_body_bytes):
     with pytest.raises(ValidationError):
@@ -98,6 +114,27 @@ def test_dotenv_loading_without_developer_environment(tmp_path, monkeypatch):
     assert settings.max_webhook_body_bytes == 4096
 
 
+def test_dotenv_database_url_coexists_with_application_settings(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("MAX_EVENTS", raising=False)
+    monkeypatch.delenv("MAX_WEBHOOK_BODY_BYTES", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "WEBHOOK_SECRET=synthetic-dotenv-secret\n"
+        "MAX_EVENTS=9\n"
+        "MAX_WEBHOOK_BODY_BYTES=4096\n"
+        "DATABASE_URL=postgresql+psycopg://example_user:example_password@example-host:5432/example_database\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=env_file)
+
+    assert settings.webhook_secret.get_secret_value() == "synthetic-dotenv-secret"
+    assert settings.max_events == 9
+    assert settings.max_webhook_body_bytes == 4096
+
+
 def test_secret_value_is_redacted_in_settings_representation():
     settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
 
@@ -110,6 +147,44 @@ def test_app_import_succeeds_with_valid_synthetic_configuration():
     env["WEBHOOK_SECRET"] = "synthetic-import-secret"
     env["MAX_EVENTS"] = "5"
     env["MAX_WEBHOOK_BODY_BYTES"] = "1024"
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.main; print(app.main.app.title)"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "GitHub Webhook Monitor"
+
+
+def test_app_import_succeeds_without_database_url():
+    env = os.environ.copy()
+    env["WEBHOOK_SECRET"] = "synthetic-import-secret"
+    env["MAX_EVENTS"] = "5"
+    env["MAX_WEBHOOK_BODY_BYTES"] = "1024"
+    env.pop("DATABASE_URL", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.main; print(app.main.app.title)"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "GitHub Webhook Monitor"
+
+
+def test_app_import_succeeds_with_unavailable_database_url_without_connecting():
+    env = os.environ.copy()
+    env["WEBHOOK_SECRET"] = "synthetic-import-secret"
+    env["MAX_EVENTS"] = "5"
+    env["MAX_WEBHOOK_BODY_BYTES"] = "1024"
+    env["DATABASE_URL"] = "postgresql+psycopg://example_user:example_password@127.0.0.1:1/example_database"
 
     result = subprocess.run(
         [sys.executable, "-c", "import app.main; print(app.main.app.title)"],

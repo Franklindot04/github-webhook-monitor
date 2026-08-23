@@ -6,8 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
+    "alembic>=1.16,<2.0",
     "fastapi>=0.141,<1.0",
+    "psycopg[binary]>=3.2,<4.0",
     "pydantic-settings>=2.12,<3.0",
+    "sqlalchemy>=2.0,<3.0",
     "uvicorn>=0.52,<1.0",
 ]
 
@@ -20,3 +23,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "integration: tests that require external services such as PostgreSQL",
+]
