@@ -22,8 +22,7 @@ def signature_for(payload: bytes, secret: str = TEST_SECRET) -> str:
 
 
 @pytest.fixture(autouse=True)
-def isolated_app_state(monkeypatch):
-    monkeypatch.setattr(main, "WEBHOOK_SECRET", TEST_SECRET)
+def isolated_app_state():
     events_store.clear()
     yield
     events_store.clear()

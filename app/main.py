@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import json
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from app.config import WEBHOOK_SECRET
+from app.config import settings
 from app.security import verify_github_signature
 from app.store import events_store
 
@@ -28,7 +28,9 @@ async def github_webhook(
 ):
     raw_body = await request.body()
 
-    if not verify_github_signature(raw_body, x_hub_signature_256, WEBHOOK_SECRET):
+    webhook_secret = settings.webhook_secret.get_secret_value()
+
+    if not verify_github_signature(raw_body, x_hub_signature_256, webhook_secret):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:

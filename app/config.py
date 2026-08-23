@@ -1,13 +1,23 @@
-import os
 from pathlib import Path
-from dotenv import load_dotenv
+
+from pydantic import Field, PositiveInt, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 
-load_dotenv(dotenv_path=ENV_FILE)
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
-APP_PORT = int(os.getenv("APP_PORT", "8000"))
-MAX_EVENTS = int(os.getenv("MAX_EVENTS", "50"))
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    webhook_secret: SecretStr = Field(min_length=1)
+    max_events: PositiveInt = 50
+
+
+settings = Settings()
