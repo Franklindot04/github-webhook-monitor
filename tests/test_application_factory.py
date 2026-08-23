@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.factory import create_app
+from app.storage.events import InMemoryEventStore
 
 
 def signature_for(payload: bytes, secret: str) -> str:
@@ -55,3 +56,25 @@ def test_create_app_uses_custom_settings_capacity():
     events = client.get("/events").json()["events"]
     assert len(events) == 2
     assert [event["delivery_id"] for event in events] == ["delivery-2", "delivery-1"]
+
+
+def test_injected_event_store_is_used_for_ingestion_and_listing():
+    secret = "synthetic-secret"
+    event_store = InMemoryEventStore(max_events=10)
+    settings = Settings(webhook_secret=secret, _env_file=None)
+    client = TestClient(create_app(settings=settings, event_store=event_store))
+    payload = b'{"action":"opened","repository":{"full_name":"octo/example"}}'
+
+    response = client.post(
+        "/webhook/github",
+        content=payload,
+        headers={
+            "X-GitHub-Delivery": "delivery-001",
+            "X-Hub-Signature-256": signature_for(payload, secret),
+        },
+    )
+
+    assert response.status_code == 200
+    stored_events = [event.to_dict() for event in event_store.list_recent()]
+    assert stored_events == [response.json()["event"]]
+    assert client.get("/events").json() == {"count": 1, "events": stored_events}

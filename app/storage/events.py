@@ -28,6 +28,3 @@ class InMemoryEventStore:
 
     def list_recent(self) -> list[EventSummary]:
         return list(self._events)
-
-    def clear(self) -> None:
-        self._events.clear()

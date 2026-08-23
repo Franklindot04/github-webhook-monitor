@@ -9,11 +9,10 @@ from app.storage.events import EventStore, InMemoryEventStore
 def create_app(
     settings: Settings | None = None,
     event_store: EventStore | None = None,
-    webhook_service: WebhookIngestionService | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings()
     app_event_store = event_store or InMemoryEventStore(max_events=app_settings.max_events)
-    app_webhook_service = webhook_service or WebhookIngestionService(
+    app_webhook_service = WebhookIngestionService(
         event_store=app_event_store,
         webhook_secret=app_settings.webhook_secret.get_secret_value(),
     )
