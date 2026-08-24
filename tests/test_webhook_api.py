@@ -1204,12 +1204,20 @@ def test_github_redelivery_endpoint_accepts_verified_exact_upstream_record(deliv
 
     assert response.status_code == 202
     assert response.json() == {
+        "action_id": response.json()["action_id"],
         "attempt_id": attempt_id,
         "delivery_guid": "delivery-001",
         "hook_id": 12345,
         "github_delivery_id": 101,
         "status": "accepted",
     }
+    action_id = response.json()["action_id"]
+    action_response = client.get(f"/api/v1/recovery-actions/{action_id}", headers=management_headers())
+    assert action_response.status_code == 200
+    assert action_response.json()["state"] == "accepted"
+    assert action_response.json()["authentication_method"] == "management_bearer"
+    assert action_response.json()["attempt_id"] == attempt_id
+    assert action_response.json()["github_delivery_id"] == 101
     assert github_client.calls == [
         {"owner": "octo", "repository": "example", "hook_id": 12345, "cursor": None}
     ]
@@ -1217,6 +1225,67 @@ def test_github_redelivery_endpoint_accepts_verified_exact_upstream_record(deliv
         {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 101}
     ]
     assert len(delivery_store.list_recent()) == 1
+
+
+def test_recovery_actions_list_is_management_authenticated_and_paginated(delivery_store):
+    first_github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    first_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, first_github_client, first_redelivery_client)
+    first_response = post_webhook(
+        client,
+        encode_json({"repository": {"full_name": "octo/example"}}),
+        {"X-GitHub-Delivery": "delivery-001", "X-Hub-Signature-256": signature_for(encode_json({"repository": {"full_name": "octo/example"}}))},
+    )
+    first_attempt_id = first_response.json()["event"]["attempt_id"]
+    first_redelivery = client.post(
+        f"/api/v1/delivery-attempts/{first_attempt_id}/github-deliveries/100/redelivery",
+        headers=management_headers(),
+    )
+    assert first_redelivery.status_code == 202
+
+    second_payload = encode_json({"repository": {"full_name": "octo/example"}})
+    second_response = post_webhook(
+        client,
+        second_payload,
+        {"X-GitHub-Delivery": "delivery-002", "X-Hub-Signature-256": signature_for(second_payload)},
+    )
+    second_attempt_id = second_response.json()["event"]["attempt_id"]
+    first_github_client.pages.append(GitHubDeliveryPage(deliveries=[make_github_delivery(101, guid="delivery-002")], next_cursor=None))
+    second_redelivery = client.post(
+        f"/api/v1/delivery-attempts/{second_attempt_id}/github-deliveries/101/redelivery",
+        headers=management_headers(),
+    )
+    assert second_redelivery.status_code == 202
+
+    unauthorized = client.get("/api/v1/recovery-actions")
+    assert unauthorized.status_code == 401
+
+    page = client.get("/api/v1/recovery-actions?limit=1", headers=management_headers())
+    assert page.status_code == 200
+    body = page.json()
+    assert len(body["items"]) == 1
+    assert body["next_cursor"] is not None
+    assert body["items"][0]["action_id"] == second_redelivery.json()["action_id"]
+    next_page = client.get(f"/api/v1/recovery-actions?limit=1&cursor={body['next_cursor']}", headers=management_headers())
+    assert next_page.status_code == 200
+    assert [item["action_id"] for item in next_page.json()["items"]] == [first_redelivery.json()["action_id"]]
+
+
+def test_recovery_actions_invalid_cursor_and_detail_errors(delivery_store):
+    github_client = RecordingGitHubDeliveryClient([])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+
+    assert client.get("/api/v1/recovery-actions?limit=0", headers=management_headers()).status_code == 422
+    assert client.get("/api/v1/recovery-actions?cursor=bad", headers=management_headers()).status_code == 400
+    assert client.get("/api/v1/recovery-actions/not-a-uuid", headers=management_headers()).status_code == 422
+    missing = client.get(
+        "/api/v1/recovery-actions/00000000-0000-0000-0000-000000000001",
+        headers=management_headers(),
+    )
+    assert missing.status_code == 404
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ from app.security import require_management_access
 from app.services.delivery_queries import DeliveryQueryService
 from app.services.github_reconciliation import GitHubReconciliationService
 from app.services.github_redelivery import GitHubRedeliveryService
+from app.services.recovery_actions import RecoveryActionQueryService
 from app.services.webhooks import (
     InvalidWebhookSignatureError,
     MalformedWebhookPayloadError,
@@ -96,6 +97,7 @@ def create_router(
     management_api_token: str | None,
     github_reconciliation_service: GitHubReconciliationService | None = None,
     github_redelivery_service: GitHubRedeliveryService | None = None,
+    recovery_action_query_service: RecoveryActionQueryService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -126,6 +128,7 @@ def create_router(
             management_access_dependency=require_configured_management_access,
             reconciliation_service=github_reconciliation_service,
             redelivery_service=github_redelivery_service,
+            recovery_action_query_service=recovery_action_query_service,
         )
     )
 

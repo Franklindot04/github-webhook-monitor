@@ -11,25 +11,33 @@ from app.integrations.github.client import (
 )
 from app.runtime import RuntimeResources, build_runtime_resources
 from app.services.delivery_queries import DeliveryQueryService
+from app.services.recovery_actions import RecoveryActionQueryService
 from app.services.github_reconciliation import GitHubReconciliationService
 from app.services.github_redelivery import GitHubRedeliveryService
 from app.services.webhooks import WebhookIngestionService
 from app.storage.deliveries import DeliveryStore
+from app.storage.recovery_actions import InMemoryRecoveryActionStore, RecoveryActionStore
 
 
 def create_app(
     settings: Settings | None = None,
     delivery_store: DeliveryStore | None = None,
+    recovery_action_store: RecoveryActionStore | None = None,
     github_delivery_client: GitHubRepositoryWebhookDeliveriesClient | None = None,
     github_redelivery_client: GitHubRepositoryWebhookRedeliveryClient | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings()
     runtime_resources = (
-        RuntimeResources(delivery_store=delivery_store, readiness_check=lambda: None)
+        RuntimeResources(
+            delivery_store=delivery_store,
+            recovery_action_store=recovery_action_store or InMemoryRecoveryActionStore(max_actions=app_settings.max_events),
+            readiness_check=lambda: None,
+        )
         if delivery_store is not None
         else build_runtime_resources(app_settings)
     )
     app_delivery_store = runtime_resources.delivery_store
+    app_recovery_action_store = runtime_resources.recovery_action_store
     app_webhook_service = WebhookIngestionService(
         delivery_store=app_delivery_store,
         webhook_secret=app_settings.webhook_secret.get_secret_value(),
@@ -64,6 +72,7 @@ def create_app(
         enabled=app_settings.github_redelivery_enabled,
         reconciliation_service=app_github_reconciliation_service,
         github_redelivery_client=app_github_redelivery_client,
+        recovery_action_store=app_recovery_action_store,
     )
 
     @asynccontextmanager
@@ -82,6 +91,7 @@ def create_app(
     app = FastAPI(title="GitHub Webhook Monitor", version="0.1.0", lifespan=lifespan)
     app.state.settings = app_settings
     app.state.delivery_store = app_delivery_store
+    app.state.recovery_action_store = app_recovery_action_store
     app.state.runtime_resources = runtime_resources
     app.state.webhook_service = app_webhook_service
     app.state.github_delivery_client = app_github_delivery_client
@@ -102,6 +112,7 @@ def create_app(
             ),
             github_reconciliation_service=app_github_reconciliation_service,
             github_redelivery_service=app_github_redelivery_service,
+            recovery_action_query_service=RecoveryActionQueryService(app_recovery_action_store),
         )
     )
     return app

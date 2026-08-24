@@ -10,8 +10,13 @@ from app.services.github_reconciliation import (
     GitHubReconciliationService,
     UnsupportedGitHubReconciliationTargetError,
 )
-from app.services.github_redelivery import GitHubRedeliveryService, UnverifiedGitHubRedeliveryTargetError
+from app.services.github_redelivery import (
+    GitHubRedeliveryJournalUnavailableError,
+    GitHubRedeliveryService,
+    UnverifiedGitHubRedeliveryTargetError,
+)
 from app.storage.deliveries import InMemoryDeliveryStore
+from app.storage.recovery_actions import InMemoryRecoveryActionStore, RecoveryActionStoreError
 
 
 ATTEMPT_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -92,12 +97,23 @@ class RecordingGitHubRedeliveryClient:
         )
 
 
+class FailingRecoveryActionStore(InMemoryRecoveryActionStore):
+    def create_initiated_github_redelivery(self, **kwargs):
+        raise RecoveryActionStoreError("synthetic journal outage")
+
+
+class FailingFinalizeRecoveryActionStore(InMemoryRecoveryActionStore):
+    def finalize(self, **kwargs):
+        raise RecoveryActionStoreError("synthetic journal outage")
+
+
 def service_with_store(
     store: InMemoryDeliveryStore,
     github_delivery_client,
     github_redelivery_client,
     *,
     max_pages: int = 5,
+    recovery_action_store=None,
 ) -> GitHubRedeliveryService:
     reconciliation_service = GitHubReconciliationService(
         enabled=True,
@@ -109,6 +125,7 @@ def service_with_store(
         enabled=True,
         reconciliation_service=reconciliation_service,
         github_redelivery_client=github_redelivery_client,
+        recovery_action_store=recovery_action_store or InMemoryRecoveryActionStore(max_actions=10),
     )
 
 
@@ -186,6 +203,7 @@ async def test_verified_upstream_target_requests_one_redelivery():
     result = await service.request_redelivery(attempt=attempt, github_delivery_id=100)
 
     assert result.status == "accepted"
+    assert result.action_id
     assert result.attempt is attempt
     assert result.github_delivery_id == 100
     assert github_delivery_client.calls == [
@@ -195,6 +213,55 @@ async def test_verified_upstream_target_requests_one_redelivery():
         {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 100}
     ]
     assert len(store.list_recent()) == 1
+
+
+@pytest.mark.anyio
+async def test_journal_create_failure_prevents_mutation():
+    attempt = make_attempt()
+    store = InMemoryDeliveryStore(max_events=10)
+    store.add(attempt)
+    github_delivery_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_delivery(github_delivery_id=100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    service = service_with_store(
+        store,
+        github_delivery_client,
+        github_redelivery_client,
+        recovery_action_store=FailingRecoveryActionStore(max_actions=10),
+    )
+
+    with pytest.raises(GitHubRedeliveryJournalUnavailableError):
+        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+
+    assert len(github_delivery_client.calls) == 1
+    assert github_redelivery_client.calls == []
+
+
+@pytest.mark.anyio
+async def test_journal_finalize_failure_does_not_repeat_mutation():
+    attempt = make_attempt()
+    store = InMemoryDeliveryStore(max_events=10)
+    store.add(attempt)
+    github_delivery_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_delivery(github_delivery_id=100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    recovery_action_store = FailingFinalizeRecoveryActionStore(max_actions=10)
+    service = service_with_store(
+        store,
+        github_delivery_client,
+        github_redelivery_client,
+        recovery_action_store=recovery_action_store,
+    )
+
+    with pytest.raises(GitHubRedeliveryJournalUnavailableError):
+        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+
+    assert github_redelivery_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 100}
+    ]
+    assert len(recovery_action_store.list_recent(limit=10)) == 1
 
 
 @pytest.mark.anyio
