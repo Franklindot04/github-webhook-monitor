@@ -25,6 +25,10 @@ class GitHubUpstreamProtocolError(GitHubUpstreamError):
     pass
 
 
+class GitHubRedeliveryOutcomeUnknownError(GitHubUpstreamError):
+    pass
+
+
 class GitHubRepositoryWebhookDeliveriesClient:
     def __init__(
         self,
@@ -38,12 +42,7 @@ class GitHubRepositoryWebhookDeliveriesClient:
             base_url=GITHUB_API_BASE_URL,
             timeout=timeout_seconds,
         )
-        self._headers = {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": GITHUB_USER_AGENT,
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        }
+        self._headers = github_headers(token)
 
     async def aclose(self) -> None:
         if self._owns_http_client:
@@ -89,10 +88,79 @@ class GitHubRepositoryWebhookDeliveriesClient:
         )
 
 
+class GitHubRepositoryWebhookRedeliveryClient:
+    def __init__(
+        self,
+        *,
+        token: str,
+        timeout_seconds: int,
+        http_client: httpx2.AsyncClient | None = None,
+    ):
+        self._owns_http_client = http_client is None
+        self._http_client = http_client or httpx2.AsyncClient(
+            base_url=GITHUB_API_BASE_URL,
+            timeout=timeout_seconds,
+        )
+        self._headers = github_headers(token)
+
+    async def aclose(self) -> None:
+        if self._owns_http_client:
+            await self._http_client.aclose()
+
+    async def request_repository_webhook_redelivery(
+        self,
+        *,
+        owner: str,
+        repository: str,
+        hook_id: int,
+        github_delivery_id: int,
+    ) -> None:
+        path = repository_redelivery_path(
+            owner=owner,
+            repository=repository,
+            hook_id=hook_id,
+            github_delivery_id=github_delivery_id,
+        )
+        try:
+            response = await self._http_client.post(path, headers=self._headers)
+        except (httpx2.ConnectError, httpx2.ConnectTimeout) as exc:
+            raise GitHubUpstreamUnavailableError("GitHub upstream unavailable") from exc
+        except (httpx2.TimeoutException, httpx2.RequestError) as exc:
+            raise GitHubRedeliveryOutcomeUnknownError("GitHub redelivery outcome could not be confirmed") from exc
+
+        if response.status_code == 202:
+            return
+        if response.status_code == 429 or response.status_code >= 500 or _is_rate_limited(response):
+            raise GitHubUpstreamUnavailableError("GitHub upstream unavailable")
+        raise GitHubUpstreamProtocolError("GitHub upstream request failed")
+
+
+def github_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": GITHUB_USER_AGENT,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+
+
 def repository_deliveries_path(*, owner: str, repository: str, hook_id: int) -> str:
     return (
         f"/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
         f"/hooks/{hook_id}/deliveries"
+    )
+
+
+def repository_redelivery_path(
+    *,
+    owner: str,
+    repository: str,
+    hook_id: int,
+    github_delivery_id: int,
+) -> str:
+    return (
+        f"/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+        f"/hooks/{hook_id}/deliveries/{github_delivery_id}/attempts"
     )
 
 

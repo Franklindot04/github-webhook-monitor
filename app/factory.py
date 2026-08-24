@@ -5,10 +5,14 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.routes import create_router
 from app.config import Settings
-from app.integrations.github.client import GitHubRepositoryWebhookDeliveriesClient
+from app.integrations.github.client import (
+    GitHubRepositoryWebhookDeliveriesClient,
+    GitHubRepositoryWebhookRedeliveryClient,
+)
 from app.runtime import RuntimeResources, build_runtime_resources
 from app.services.delivery_queries import DeliveryQueryService
 from app.services.github_reconciliation import GitHubReconciliationService
+from app.services.github_redelivery import GitHubRedeliveryService
 from app.services.webhooks import WebhookIngestionService
 from app.storage.deliveries import DeliveryStore
 
@@ -17,6 +21,7 @@ def create_app(
     settings: Settings | None = None,
     delivery_store: DeliveryStore | None = None,
     github_delivery_client: GitHubRepositoryWebhookDeliveriesClient | None = None,
+    github_redelivery_client: GitHubRepositoryWebhookRedeliveryClient | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings()
     runtime_resources = (
@@ -45,6 +50,21 @@ def create_app(
         github_client=app_github_delivery_client,
         max_pages=app_settings.github_reconciliation_max_pages,
     )
+    app_github_redelivery_client = github_redelivery_client
+    owns_github_redelivery_client = False
+    if app_settings.github_redelivery_enabled and app_github_redelivery_client is None:
+        if app_settings.github_repository_webhook_write_token is None:
+            raise ValueError("GITHUB_REPOSITORY_WEBHOOK_WRITE_TOKEN is required when redelivery is enabled")
+        app_github_redelivery_client = GitHubRepositoryWebhookRedeliveryClient(
+            token=app_settings.github_repository_webhook_write_token.get_secret_value(),
+            timeout_seconds=app_settings.github_api_timeout_seconds,
+        )
+        owns_github_redelivery_client = True
+    app_github_redelivery_service = GitHubRedeliveryService(
+        enabled=app_settings.github_redelivery_enabled,
+        reconciliation_service=app_github_reconciliation_service,
+        github_redelivery_client=app_github_redelivery_client,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -52,6 +72,8 @@ def create_app(
             await run_in_threadpool(runtime_resources.readiness_check)
             yield
         finally:
+            if owns_github_redelivery_client and app_github_redelivery_client is not None:
+                await app_github_redelivery_client.aclose()
             if owns_github_delivery_client and app_github_delivery_client is not None:
                 await app_github_delivery_client.aclose()
             if runtime_resources.owns_engine and runtime_resources.engine is not None:
@@ -64,6 +86,8 @@ def create_app(
     app.state.webhook_service = app_webhook_service
     app.state.github_delivery_client = app_github_delivery_client
     app.state.github_reconciliation_service = app_github_reconciliation_service
+    app.state.github_redelivery_client = app_github_redelivery_client
+    app.state.github_redelivery_service = app_github_redelivery_service
     app.include_router(
         create_router(
             app_webhook_service,
@@ -77,6 +101,7 @@ def create_app(
                 else None
             ),
             github_reconciliation_service=app_github_reconciliation_service,
+            github_redelivery_service=app_github_redelivery_service,
         )
     )
     return app

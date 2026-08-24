@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from app.api.routes import is_json_content_type, read_bounded_body, validate_content_length
 from app.config import Settings
 from app.factory import create_app
-from app.integrations.github.client import GitHubRepositoryWebhookDeliveriesClient
+from app.integrations.github.client import GitHubRedeliveryOutcomeUnknownError, GitHubRepositoryWebhookDeliveriesClient
 from app.integrations.github.models import GitHubDeliveryPage, GitHubDeliverySummary
 from app.services.github_reconciliation import (
     GitHubUpstreamProtocolError,
@@ -28,6 +28,7 @@ from app.storage.deliveries import DeliveryStoreError, InMemoryDeliveryStore
 TEST_SECRET = "test-webhook-secret"
 MANAGEMENT_TOKEN = "synthetic-management-token-000001"
 GITHUB_TOKEN = "synthetic-github-token"
+GITHUB_WRITE_TOKEN = "synthetic-github-write-token"
 
 
 def encode_json(value: object) -> bytes:
@@ -85,6 +86,27 @@ class RecordingGitHubDeliveryClient:
         if self.exc is not None:
             raise self.exc
         return self.pages.pop(0)
+
+    async def aclose(self):
+        pass
+
+
+class RecordingGitHubRedeliveryClient:
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc
+        self.calls = []
+
+    async def request_repository_webhook_redelivery(self, *, owner, repository, hook_id, github_delivery_id):
+        self.calls.append(
+            {
+                "owner": owner,
+                "repository": repository,
+                "hook_id": hook_id,
+                "github_delivery_id": github_delivery_id,
+            }
+        )
+        if self.exc is not None:
+            raise self.exc
 
     async def aclose(self):
         pass
@@ -618,6 +640,8 @@ def test_events_openapi_declares_bearer_auth_when_management_enabled(delivery_st
         management_api_token=MANAGEMENT_TOKEN,
         github_reconciliation_enabled=True,
         github_repository_webhook_token=GITHUB_TOKEN,
+        github_redelivery_enabled=True,
+        github_repository_webhook_write_token=GITHUB_WRITE_TOKEN,
         _env_file=None,
     )
     app = create_app(settings=settings, delivery_store=delivery_store)
@@ -633,8 +657,13 @@ def test_events_openapi_declares_bearer_auth_when_management_enabled(delivery_st
     assert openapi["paths"]["/api/v1/delivery-attempts"]["get"]["security"] == [{"HTTPBearer": []}]
     assert openapi["paths"]["/api/v1/delivery-attempts/{attempt_id}"]["get"]["security"] == [{"HTTPBearer": []}]
     reconciliation_operation = openapi["paths"]["/api/v1/delivery-attempts/{attempt_id}/github-deliveries"]["get"]
+    redelivery_operation = openapi["paths"][
+        "/api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery"
+    ]["post"]
     assert reconciliation_operation["security"] == [{"HTTPBearer": []}]
     assert "Reconcile" in reconciliation_operation["summary"]
+    assert redelivery_operation["security"] == [{"HTTPBearer": []}]
+    assert "redeliver" in redelivery_operation["summary"].lower()
     list_parameters = {
         parameter["name"]: parameter
         for parameter in openapi["paths"]["/api/v1/delivery-attempts"]["get"]["parameters"]
@@ -662,6 +691,9 @@ def test_events_openapi_declares_bearer_auth_when_management_enabled(delivery_st
     }
     assert reconciliation_parameters["attempt_id"]["schema"]["format"] == "uuid"
     assert "Opaque reconciliation continuation cursor" in reconciliation_parameters["cursor"]["description"]
+    redelivery_parameters = {parameter["name"]: parameter for parameter in redelivery_operation["parameters"]}
+    assert redelivery_parameters["attempt_id"]["schema"]["format"] == "uuid"
+    assert "GitHub upstream numeric" in redelivery_parameters["github_delivery_id"]["description"]
 
 
 def reconciliation_client(
@@ -686,6 +718,36 @@ def reconciliation_client(
             settings=settings,
             delivery_store=delivery_store,
             github_delivery_client=github_client,
+        )
+    )
+
+
+def redelivery_client(
+    delivery_store,
+    github_client: RecordingGitHubDeliveryClient,
+    github_redelivery_client: RecordingGitHubRedeliveryClient,
+    *,
+    max_pages: int = 5,
+):
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        max_events=delivery_store.max_events,
+        max_webhook_body_bytes=4096,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        github_redelivery_enabled=True,
+        github_repository_webhook_write_token=GITHUB_WRITE_TOKEN,
+        github_reconciliation_max_pages=max_pages,
+        _env_file=None,
+    )
+    return TestClient(
+        create_app(
+            settings=settings,
+            delivery_store=delivery_store,
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
         )
     )
 
@@ -962,6 +1024,240 @@ def test_github_reconciliation_maps_rate_limit_classification_without_leaking_de
     assert response.json() == {"detail": expected_detail}
     assert "hidden upstream body" not in response.text
     assert len(seen_requests) == 1
+
+
+def test_github_redelivery_feature_disabled_returns_not_found_before_validation_or_github(delivery_store):
+    github_client = RecordingGitHubDeliveryClient([GitHubDeliveryPage(deliveries=[], next_cursor=None)])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(
+        create_app(
+            settings=settings,
+            delivery_store=delivery_store,
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
+        )
+    )
+
+    response = client.post(
+        "/api/v1/delivery-attempts/not-a-uuid/github-deliveries/not-an-int/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 404
+    assert github_client.calls == []
+    assert github_redelivery_client.calls == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/delivery-attempts/not-a-uuid/github-deliveries/not-an-int/redelivery",
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001/github-deliveries/100/redelivery",
+    ],
+)
+def test_unauthorized_github_redelivery_rejects_before_validation_or_github(delivery_store, path):
+    github_client = RecordingGitHubDeliveryClient([GitHubDeliveryPage(deliveries=[], next_cursor=None)])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+
+    response = client.post(path)
+
+    assert response.status_code == 401
+    assert github_client.calls == []
+    assert github_redelivery_client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("attempt_id", "github_delivery_id", "expected_detail"),
+    [
+        ("not-a-uuid", "100", "Invalid attempt_id"),
+        ("00000000-0000-0000-0000-000000000001", "not-an-int", "Invalid github_delivery_id"),
+        ("00000000-0000-0000-0000-000000000001", "0", "Invalid github_delivery_id"),
+    ],
+)
+def test_github_redelivery_validates_path_identifiers_without_github_call(
+    delivery_store,
+    attempt_id,
+    github_delivery_id,
+    expected_detail,
+):
+    github_client = RecordingGitHubDeliveryClient([GitHubDeliveryPage(deliveries=[], next_cursor=None)])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+
+    response = client.post(
+        f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": expected_detail}
+    assert github_client.calls == []
+    assert github_redelivery_client.calls == []
+
+
+def test_missing_local_attempt_redelivery_returns_not_found_without_github_call(delivery_store):
+    github_client = RecordingGitHubDeliveryClient([GitHubDeliveryPage(deliveries=[], next_cursor=None)])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+
+    response = client.post(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001/github-deliveries/100/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Delivery attempt not found"}
+    assert github_client.calls == []
+    assert github_redelivery_client.calls == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"repository": {"full_name": "octo"}},
+        {"repository": {"full_name": "octo/example/extra"}},
+    ],
+)
+def test_unsupported_redelivery_target_returns_conflict_without_github_call(delivery_store, payload):
+    github_client = RecordingGitHubDeliveryClient([GitHubDeliveryPage(deliveries=[], next_cursor=None)])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+    webhook_response = post_webhook(client, encode_json(payload))
+    attempt_id = webhook_response.json()["event"]["attempt_id"]
+
+    response = client.post(
+        f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Delivery attempt is not eligible for repository webhook redelivery"
+    }
+    assert github_client.calls == []
+    assert github_redelivery_client.calls == []
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        GitHubDeliveryPage(deliveries=[make_github_delivery(101)], next_cursor=None),
+        GitHubDeliveryPage(deliveries=[make_github_delivery(100, guid="other-guid")], next_cursor=None),
+        GitHubDeliveryPage(deliveries=[make_github_delivery(101)], next_cursor="more-history"),
+    ],
+)
+def test_unverified_github_redelivery_target_returns_conflict_without_mutation(delivery_store, page):
+    github_client = RecordingGitHubDeliveryClient([page])
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client, max_pages=1)
+    webhook_response = post_webhook(
+        client,
+        encode_json({"repository": {"full_name": "octo/example"}}),
+    )
+    attempt_id = webhook_response.json()["event"]["attempt_id"]
+
+    response = client.post(
+        f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "GitHub delivery could not be verified for this local attempt"}
+    assert len(github_client.calls) == 1
+    assert github_redelivery_client.calls == []
+
+
+def test_github_redelivery_endpoint_accepts_verified_exact_upstream_record(delivery_store):
+    github_client = RecordingGitHubDeliveryClient(
+        [
+            GitHubDeliveryPage(
+                deliveries=[
+                    make_github_delivery(100, redelivery=False),
+                    make_github_delivery(101, redelivery=True),
+                ],
+                next_cursor=None,
+            )
+        ]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+    webhook_response = post_webhook(
+        client,
+        encode_json({"repository": {"full_name": "octo/example"}}),
+    )
+    attempt_id = webhook_response.json()["event"]["attempt_id"]
+
+    response = client.post(
+        f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/101/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "attempt_id": attempt_id,
+        "delivery_guid": "delivery-001",
+        "hook_id": 12345,
+        "github_delivery_id": 101,
+        "status": "accepted",
+    }
+    assert github_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "cursor": None}
+    ]
+    assert github_redelivery_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 101}
+    ]
+    assert len(delivery_store.list_recent()) == 1
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_detail"),
+    [
+        (GitHubUpstreamUnavailableError("hidden upstream body"), 503, "Service unavailable"),
+        (GitHubUpstreamProtocolError("hidden upstream body"), 502, "Upstream service unavailable"),
+        (
+            GitHubRedeliveryOutcomeUnknownError("hidden upstream body"),
+            503,
+            "GitHub redelivery submission outcome could not be confirmed; reconcile before retrying",
+        ),
+    ],
+)
+def test_github_redelivery_maps_upstream_errors_without_leaking_details(
+    delivery_store,
+    exc,
+    expected_status,
+    expected_detail,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient(exc=exc)
+    client = redelivery_client(delivery_store, github_client, github_redelivery_client)
+    webhook_response = post_webhook(
+        client,
+        encode_json({"repository": {"full_name": "octo/example"}}),
+    )
+    attempt_id = webhook_response.json()["event"]["attempt_id"]
+
+    response = client.post(
+        f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+    assert "hidden upstream body" not in response.text
+    assert len(github_client.calls) == 1
+    assert len(github_redelivery_client.calls) == 1
 
 
 def test_github_upstream_outage_does_not_affect_ready(delivery_store):

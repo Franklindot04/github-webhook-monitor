@@ -48,3 +48,11 @@ class GitHubDeliveriesReconciliationResponse(BaseModel):
     matches: list[GitHubDeliverySummaryResponse]
     search_complete: bool
     next_cursor: str | None
+
+
+class GitHubRedeliveryResponse(BaseModel):
+    attempt_id: UUID
+    delivery_guid: str
+    hook_id: int
+    github_delivery_id: int
+    status: str

@@ -5,7 +5,9 @@ import pytest
 
 from app.integrations.github.client import (
     GITHUB_API_VERSION,
+    GitHubRedeliveryOutcomeUnknownError,
     GitHubRepositoryWebhookDeliveriesClient,
+    GitHubRepositoryWebhookRedeliveryClient,
     GitHubUpstreamProtocolError,
     GitHubUpstreamUnavailableError,
     extract_next_cursor,
@@ -259,3 +261,183 @@ async def test_client_rejects_malformed_success_payload(payload):
 
     with pytest.raises(GitHubUpstreamProtocolError):
         await client.list_repository_webhook_deliveries(owner="octo", repository="example", hook_id=123)
+
+
+@pytest.mark.anyio
+async def test_redelivery_client_sends_repository_webhook_redelivery_request():
+    seen_requests = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        return httpx2.Response(202)
+
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    await client.request_repository_webhook_redelivery(
+        owner="octo owner",
+        repository="repo/name",
+        hook_id=12345,
+        github_delivery_id=98765,
+    )
+
+    request = seen_requests[0]
+    assert request.method == "POST"
+    assert str(request.url) == (
+        "https://api.github.com/repos/octo%20owner/repo%2Fname/hooks/12345/deliveries/98765/attempts"
+    )
+    assert request.content == b""
+    assert request.headers["accept"] == "application/vnd.github+json"
+    assert request.headers["x-github-api-version"] == GITHUB_API_VERSION
+    assert request.headers["authorization"].startswith("Bearer ")
+    assert TOKEN not in request.headers["user-agent"]
+    assert len(seen_requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [401, 403, 404, 422])
+async def test_redelivery_client_maps_upstream_auth_or_protocol_failures(status_code):
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(
+                lambda request: httpx2.Response(status_code, json={"message": "hidden"})
+            ),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    with pytest.raises(GitHubUpstreamProtocolError):
+        await client.request_repository_webhook_redelivery(
+            owner="octo",
+            repository="example",
+            hook_id=123,
+            github_delivery_id=456,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-RateLimit-Remaining": "0"},
+        {"Retry-After": "60"},
+    ],
+)
+async def test_redelivery_client_maps_identifiable_403_rate_limits_to_unavailable(headers):
+    seen_requests = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        return httpx2.Response(403, json={"message": "hidden"}, headers=headers)
+
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    with pytest.raises(GitHubUpstreamUnavailableError):
+        await client.request_repository_webhook_redelivery(
+            owner="octo",
+            repository="example",
+            hook_id=123,
+            github_delivery_id=456,
+        )
+
+    assert len(seen_requests) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+async def test_redelivery_client_maps_unavailable_failures(status_code):
+    seen_requests = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        return httpx2.Response(status_code, json={"message": "hidden"})
+
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    with pytest.raises(GitHubUpstreamUnavailableError):
+        await client.request_repository_webhook_redelivery(
+            owner="octo",
+            repository="example",
+            hook_id=123,
+            github_delivery_id=456,
+        )
+
+    assert len(seen_requests) == 1
+
+
+@pytest.mark.anyio
+async def test_redelivery_client_maps_read_timeout_to_unknown_outcome_without_retry():
+    seen_requests = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        raise httpx2.ReadTimeout("synthetic ambiguous timeout", request=request)
+
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    with pytest.raises(GitHubRedeliveryOutcomeUnknownError):
+        await client.request_repository_webhook_redelivery(
+            owner="octo",
+            repository="example",
+            hook_id=123,
+            github_delivery_id=456,
+        )
+
+    assert len(seen_requests) == 1
+
+
+@pytest.mark.anyio
+async def test_redelivery_client_maps_connect_error_to_unavailable_without_retry():
+    seen_requests = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        raise httpx2.ConnectError("synthetic pre-connect failure", request=request)
+
+    client = GitHubRepositoryWebhookRedeliveryClient(
+        token=TOKEN,
+        timeout_seconds=5,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            base_url="https://api.github.com",
+        ),
+    )
+
+    with pytest.raises(GitHubUpstreamUnavailableError):
+        await client.request_repository_webhook_redelivery(
+            owner="octo",
+            repository="example",
+            hook_id=123,
+            github_delivery_id=456,
+        )
+
+    assert len(seen_requests) == 1

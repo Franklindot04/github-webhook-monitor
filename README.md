@@ -118,6 +118,7 @@ Once the server is running, you can open:
 | GET | `/api/v1/delivery-attempts` | Preferred management diagnostics endpoint for paginated delivery attempts |
 | GET | `/api/v1/delivery-attempts/{attempt_id}` | Preferred management diagnostics endpoint for one delivery attempt |
 | GET | `/api/v1/delivery-attempts/{attempt_id}/github-deliveries` | Management endpoint for read-only GitHub repository-webhook delivery reconciliation |
+| POST | `/api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery` | Management endpoint for verified GitHub repository-webhook redelivery requests |
 | GET | `/events` | Deprecated compatibility endpoint for recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
@@ -137,6 +138,7 @@ Management plane:
 - `GET /api/v1/delivery-attempts`
 - `GET /api/v1/delivery-attempts/{attempt_id}`
 - `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries`
+- `POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery`
 - `GET /events`
 
 ## Local webhook test
@@ -301,6 +303,7 @@ Use the versioned management diagnostics API for read-only delivery-attempt insp
 - `GET /api/v1/delivery-attempts`
 - `GET /api/v1/delivery-attempts/{attempt_id}`
 - `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries`
+- `POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery`
 
 The list endpoint returns recent observed receipt attempts in deterministic recent-first order. Responses include the application-owned `attempt_id`, GitHub logical delivery identity fields `delivery_guid` and `hook_id`, `received_at`, `payload_sha256`, event metadata, repository, sender, and installation target metadata. Responses do not include raw webhook bodies, HMAC signatures, authorization headers, database surrogate IDs, or database connection details.
 
@@ -390,6 +393,35 @@ The search uses GitHub cursor pagination with `per_page=100` and is bounded by `
 GitHub reconciliation is read-only. It does not call GitHub's delivery-detail endpoint, does not retrieve raw upstream payloads or request headers, does not persist upstream delivery records, and does not affect webhook ingestion.
 
 GitHub availability is not part of application readiness. The app does not call GitHub during startup, `GET /health` remains liveness-only, `GET /ready` remains scoped to runtime persistence readiness, and valid webhook ingestion continues even if GitHub is unavailable.
+
+## Controlled redelivery
+
+Controlled GitHub repository-webhook redelivery is disabled by default and is available only as an authenticated management-plane action. It requires Stage 10 reconciliation to remain enabled because the selected upstream delivery record is reverified before mutation.
+
+```env
+MANAGEMENT_API_ENABLED=true
+MANAGEMENT_API_TOKEN=replace-with-a-high-entropy-management-token-000001
+GITHUB_RECONCILIATION_ENABLED=true
+GITHUB_REPOSITORY_WEBHOOK_TOKEN=replace-with-a-read-only-repository-webhook-token
+GITHUB_REDELIVERY_ENABLED=true
+GITHUB_REPOSITORY_WEBHOOK_WRITE_TOKEN=replace-with-a-write-capable-repository-webhook-token
+```
+
+Stage 10 reconciliation uses the read credential and requires repository **Webhooks: read** permission. Stage 11 redelivery uses a separate write credential and requires repository **Webhooks: write** permission. Read-only operators can keep reconciliation enabled without configuring the write credential.
+
+The redelivery endpoint is:
+
+```text
+POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery
+```
+
+The endpoint starts from a local `attempt_id`, validates repository webhook coordinates, performs a bounded read-only reconciliation search, and mutates only when the selected `github_delivery_id` is found with the same local `delivery_guid`. It does not trust an arbitrary caller-supplied upstream ID and does not call GitHub's delivery-detail endpoint.
+
+On success the endpoint returns `202 Accepted`, meaning GitHub accepted the redelivery request. It does not mean the webhook has already been delivered, processed, or recorded locally. The local delivery ledger is updated only when GitHub later sends a webhook to `POST /webhook/github` and normal ingress authenticates and stores that receiver observation.
+
+The redelivery action does not create a local `DeliveryAttempt`, does not mark an existing attempt as retried or redelivered, does not persist upstream action state, and does not add replay or idempotency semantics. Repeating the management `POST` can request additional GitHub redeliveries. If the POST outcome cannot be confirmed because of a timeout or ambiguous transport failure, operators should reconcile GitHub delivery history before deciding whether to retry manually.
+
+Stage 11 does not add automatic retries, backoff, queues, workers, GitHub App redelivery, organization webhook redelivery, Enterprise host support, or upstream payload retrieval.
 
 ## Repository files
 
