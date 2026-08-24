@@ -8,6 +8,7 @@ from app.api.v1.models import (
     DeliveryAttemptsListResponse,
     GitHubDeliveriesReconciliationResponse,
     GitHubDeliverySummaryResponse,
+    GitHubRedeliveryResponse,
 )
 from app.domain.deliveries import DeliveryAttempt
 from app.integrations.github.models import GitHubDeliverySummary
@@ -24,6 +25,12 @@ from app.services.github_reconciliation import (
     GitHubUpstreamUnavailableError,
     InvalidGitHubReconciliationCursorError,
     UnsupportedGitHubReconciliationTargetError,
+)
+from app.services.github_redelivery import (
+    GitHubRedeliveryDisabledError,
+    GitHubRedeliveryOutcomeUnknownError,
+    GitHubRedeliveryService,
+    UnverifiedGitHubRedeliveryTargetError,
 )
 from app.storage.deliveries import DeliveryStoreError
 
@@ -65,6 +72,7 @@ def create_delivery_attempts_router(
     query_service: DeliveryQueryService,
     management_access_dependency,
     reconciliation_service: GitHubReconciliationService | None = None,
+    redelivery_service: GitHubRedeliveryService | None = None,
 ) -> APIRouter:
     router = APIRouter(
         prefix="/api/v1",
@@ -178,6 +186,76 @@ def create_delivery_attempts_router(
             matches=[github_delivery_to_response(delivery) for delivery in result.matches],
             search_complete=result.search_complete,
             next_cursor=result.next_cursor,
+        )
+
+    @router.post(
+        "/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery",
+        response_model=GitHubRedeliveryResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        summary="Request GitHub to redeliver one verified repository webhook delivery",
+    )
+    async def request_github_redelivery(
+        attempt_id: str = Path(
+            description="Application-owned delivery attempt UUID.",
+            json_schema_extra={"format": "uuid"},
+        ),
+        github_delivery_id: str = Path(
+            description="GitHub upstream numeric delivery-history record ID.",
+        ),
+    ):
+        if redelivery_service is None or not redelivery_service.enabled:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        try:
+            parsed_attempt_id = UUID(attempt_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid attempt_id")
+        try:
+            parsed_github_delivery_id = int(github_delivery_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid github_delivery_id")
+        if parsed_github_delivery_id <= 0:
+            raise HTTPException(status_code=422, detail="Invalid github_delivery_id")
+
+        try:
+            attempt = await run_in_threadpool(redelivery_service.get_local_attempt, parsed_attempt_id)
+        except DeliveryStoreError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable")
+        if attempt is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery attempt not found")
+
+        try:
+            result = await redelivery_service.request_redelivery(
+                attempt=attempt,
+                github_delivery_id=parsed_github_delivery_id,
+            )
+        except GitHubRedeliveryDisabledError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        except UnsupportedGitHubReconciliationTargetError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Delivery attempt is not eligible for repository webhook redelivery",
+            )
+        except UnverifiedGitHubRedeliveryTargetError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="GitHub delivery could not be verified for this local attempt",
+            )
+        except GitHubRedeliveryOutcomeUnknownError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub redelivery submission outcome could not be confirmed; reconcile before retrying",
+            )
+        except GitHubUpstreamUnavailableError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable")
+        except GitHubUpstreamProtocolError:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Upstream service unavailable")
+
+        return GitHubRedeliveryResponse(
+            attempt_id=result.attempt.attempt_id,
+            delivery_guid=result.attempt.delivery_identity.delivery_guid,
+            hook_id=result.attempt.delivery_identity.hook_id,
+            github_delivery_id=result.github_delivery_id,
+            status=result.status,
         )
 
     return router

@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     management_api_token: SecretStr | None = None
     github_reconciliation_enabled: bool = False
     github_repository_webhook_token: SecretStr | None = None
+    github_redelivery_enabled: bool = False
+    github_repository_webhook_write_token: SecretStr | None = None
     github_api_timeout_seconds: PositiveInt = 5
     github_reconciliation_max_pages: int = Field(default=5, ge=1, le=20)
 
@@ -58,5 +60,14 @@ class Settings(BaseSettings):
             if self.github_repository_webhook_token is None:
                 raise ValueError(
                     "GITHUB_REPOSITORY_WEBHOOK_TOKEN is required when GITHUB_RECONCILIATION_ENABLED=true"
+                )
+        if self.github_redelivery_enabled:
+            if not self.management_api_enabled:
+                raise ValueError("MANAGEMENT_API_ENABLED=true is required when GITHUB_REDELIVERY_ENABLED=true")
+            if not self.github_reconciliation_enabled:
+                raise ValueError("GITHUB_RECONCILIATION_ENABLED=true is required when GITHUB_REDELIVERY_ENABLED=true")
+            if self.github_repository_webhook_write_token is None:
+                raise ValueError(
+                    "GITHUB_REPOSITORY_WEBHOOK_WRITE_TOKEN is required when GITHUB_REDELIVERY_ENABLED=true"
                 )
         return self

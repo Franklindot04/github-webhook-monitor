@@ -13,6 +13,7 @@ from app.storage.deliveries import DeliveryStoreReadinessError, InMemoryDelivery
 
 MANAGEMENT_TOKEN = "synthetic-management-token-000001"
 GITHUB_TOKEN = "synthetic-github-token"
+GITHUB_WRITE_TOKEN = "synthetic-github-write-token"
 
 
 def signature_for(payload: bytes, secret: str) -> str:
@@ -40,6 +41,19 @@ def synthetic_reconciliation_settings() -> Settings:
         management_api_token=MANAGEMENT_TOKEN,
         github_reconciliation_enabled=True,
         github_repository_webhook_token=GITHUB_TOKEN,
+        _env_file=None,
+    )
+
+
+def synthetic_redelivery_settings() -> Settings:
+    return Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        github_redelivery_enabled=True,
+        github_repository_webhook_write_token=GITHUB_WRITE_TOKEN,
         _env_file=None,
     )
 
@@ -325,6 +339,8 @@ def test_reconciliation_disabled_does_not_create_github_client():
 
     assert app.state.github_delivery_client is None
     assert app.state.github_reconciliation_service.enabled is False
+    assert app.state.github_redelivery_client is None
+    assert app.state.github_redelivery_service.enabled is False
 
 
 def test_reconciliation_enabled_creates_one_app_owned_client_and_closes_on_shutdown():
@@ -386,3 +402,87 @@ def test_github_client_closes_when_startup_fails_for_database_readiness(monkeypa
 
     assert created_engines
     assert github_client._http_client.is_closed
+
+
+def test_redelivery_disabled_does_not_create_write_client():
+    app = create_app(settings=synthetic_reconciliation_settings())
+
+    assert app.state.github_delivery_client is not None
+    assert app.state.github_redelivery_client is None
+    assert app.state.github_redelivery_service.enabled is False
+
+
+def test_redelivery_enabled_creates_one_app_owned_write_client_and_closes_on_shutdown():
+    app = create_app(settings=synthetic_redelivery_settings())
+    read_client = app.state.github_delivery_client
+    write_client = app.state.github_redelivery_client
+
+    assert read_client is not None
+    assert write_client is not None
+
+    with TestClient(app):
+        assert app.state.github_delivery_client is read_client
+        assert app.state.github_redelivery_client is write_client
+
+    assert read_client._http_client.is_closed
+    assert write_client._http_client.is_closed
+
+
+def test_injected_github_redelivery_client_is_reused_and_not_owned():
+    github_delivery_client = RecordingGitHubDeliveryClient()
+    github_redelivery_client = RecordingGitHubDeliveryClient()
+    app = create_app(
+        settings=synthetic_redelivery_settings(),
+        github_delivery_client=github_delivery_client,
+        github_redelivery_client=github_redelivery_client,
+    )
+
+    with TestClient(app):
+        assert app.state.github_delivery_client is github_delivery_client
+        assert app.state.github_redelivery_client is github_redelivery_client
+        assert app.state.github_redelivery_service.enabled is True
+
+    assert github_delivery_client.close_count == 0
+    assert github_redelivery_client.close_count == 0
+
+
+def test_github_redelivery_client_closes_when_startup_fails_for_database_readiness(monkeypatch):
+    created_engines = []
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def create_fake_engine(database_url, *, connect_timeout_seconds, pool_pre_ping):
+        engine = FakeEngine()
+        created_engines.append(engine)
+        return engine
+
+    def fake_readiness_check(engine):
+        raise DeliveryStoreReadinessError("synthetic readiness failure")
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", create_fake_engine)
+    monkeypatch.setattr(app_runtime, "verify_delivery_store_ready", fake_readiness_check)
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="postgresql",
+        database_url="postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        github_redelivery_enabled=True,
+        github_repository_webhook_write_token=GITHUB_WRITE_TOKEN,
+        _env_file=None,
+    )
+    app = create_app(settings=settings)
+    read_client = app.state.github_delivery_client
+    write_client = app.state.github_redelivery_client
+
+    with pytest.raises(DeliveryStoreReadinessError):
+        with TestClient(app):
+            pass
+
+    assert created_engines
+    assert read_client._http_client.is_closed
+    assert write_client._http_client.is_closed
