@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import pytest
 from alembic import command
@@ -12,6 +13,7 @@ from sqlalchemy import create_engine, func, select, text
 
 from app.config import Settings
 from app.factory import create_app
+from app.integrations.github.models import GitHubDeliveryPage, GitHubDeliverySummary
 from app.persistence.schema import delivery_attempts, github_deliveries
 from app.storage.deliveries import DeliveryStoreReadinessError
 
@@ -22,6 +24,44 @@ pytestmark = pytest.mark.integration
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 TEST_SECRET = "test-webhook-secret"
 MANAGEMENT_TOKEN = "synthetic-management-token-000001"
+GITHUB_TOKEN = "synthetic-github-token"
+
+
+class RecordingGitHubDeliveryClient:
+    def __init__(self, pages: list[GitHubDeliveryPage]):
+        self.pages = list(pages)
+        self.calls = []
+
+    async def list_repository_webhook_deliveries(self, *, owner, repository, hook_id, cursor=None):
+        self.calls.append(
+            {
+                "owner": owner,
+                "repository": repository,
+                "hook_id": hook_id,
+                "cursor": cursor,
+            }
+        )
+        return self.pages.pop(0)
+
+    async def aclose(self):
+        pass
+
+
+def make_github_delivery(delivery_id: int, *, guid: str = "delivery-001", redelivery: bool = False):
+    return GitHubDeliverySummary(
+        github_delivery_id=delivery_id,
+        delivery_guid=guid,
+        delivered_at=datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc),
+        redelivery=redelivery,
+        duration=0.2,
+        status="OK",
+        status_code=200,
+        event="pull_request",
+        action="opened",
+        installation_id=111,
+        repository_id=222,
+        throttled_at=None,
+    )
 
 
 def require_test_database_url() -> str:
@@ -70,6 +110,24 @@ def runtime_settings(database_url: str) -> Settings:
         database_connect_timeout_seconds=2,
         management_api_enabled=True,
         management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+
+
+def reconciliation_runtime_settings(database_url: str, *, max_pages: int = 5) -> Settings:
+    settings = runtime_settings(database_url)
+    return Settings(
+        webhook_secret=settings.webhook_secret.get_secret_value(),
+        max_events=settings.max_events,
+        max_webhook_body_bytes=settings.max_webhook_body_bytes,
+        delivery_store_backend="postgresql",
+        database_url=database_url,
+        database_connect_timeout_seconds=settings.database_connect_timeout_seconds,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        github_reconciliation_max_pages=max_pages,
         _env_file=None,
     )
 
@@ -246,6 +304,99 @@ def test_postgresql_runtime_v1_pagination_is_stable_when_new_attempt_arrives_bet
     assert len(traversed_attempt_ids) == len(set(traversed_attempt_ids))
     with engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 5
+
+
+def test_postgresql_runtime_reconciles_attempt_with_mocked_github_multiple_matches(
+    database_url: str,
+    engine,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [
+            GitHubDeliveryPage(
+                deliveries=[
+                    make_github_delivery(100, redelivery=False),
+                    make_github_delivery(101, redelivery=True),
+                    make_github_delivery(102, guid="other-guid"),
+                ],
+                next_cursor=None,
+            )
+        ]
+    )
+    payload = encode_json(
+        {
+            "action": "opened",
+            "repository": {"full_name": "octo/example"},
+            "sender": {"login": "octocat"},
+        }
+    )
+
+    with TestClient(
+        create_app(
+            settings=reconciliation_runtime_settings(database_url),
+            github_delivery_client=github_client,
+        )
+    ) as client:
+        webhook_response = post_webhook(client, payload, delivery_id="delivery-001")
+        assert webhook_response.status_code == 200
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        reconciliation_response = client.get(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries",
+            headers=management_headers(),
+        )
+
+    assert reconciliation_response.status_code == 200
+    body = reconciliation_response.json()
+    assert body["attempt_id"] == attempt_id
+    assert body["delivery_guid"] == "delivery-001"
+    assert body["hook_id"] == 12345
+    assert [match["github_delivery_id"] for match in body["matches"]] == [100, 101]
+    assert [match["redelivery"] for match in body["matches"]] == [False, True]
+    assert body["search_complete"] is True
+    assert github_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "cursor": None}
+    ]
+    with engine.connect() as connection:
+        assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 1
+
+
+def test_postgresql_runtime_reconciliation_continues_bounded_search(
+    database_url: str,
+    engine,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [
+            GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor="page-two"),
+            GitHubDeliveryPage(deliveries=[make_github_delivery(101, redelivery=True)], next_cursor=None),
+        ]
+    )
+    payload = encode_json({"repository": {"full_name": "octo/example"}})
+
+    with TestClient(
+        create_app(
+            settings=reconciliation_runtime_settings(database_url, max_pages=1),
+            github_delivery_client=github_client,
+        )
+    ) as client:
+        webhook_response = post_webhook(client, payload, delivery_id="delivery-001")
+        assert webhook_response.status_code == 200
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        first_response = client.get(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries",
+            headers=management_headers(),
+        )
+        assert first_response.status_code == 200
+        second_response = client.get(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries"
+            f"?cursor={first_response.json()['next_cursor']}",
+            headers=management_headers(),
+        )
+
+    assert second_response.status_code == 200
+    assert first_response.json()["search_complete"] is False
+    assert [match["github_delivery_id"] for match in first_response.json()["matches"]] == [100]
+    assert second_response.json()["search_complete"] is True
+    assert [match["github_delivery_id"] for match in second_response.json()["matches"]] == [101]
+    assert [call["cursor"] for call in github_client.calls] == [None, "page-two"]
 
 
 def test_postgresql_runtime_persists_events_across_application_restart(

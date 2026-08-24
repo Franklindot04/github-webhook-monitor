@@ -9,6 +9,7 @@ from app.config import Settings
 
 
 MANAGEMENT_TOKEN = "synthetic-management-token-000001"
+GITHUB_TOKEN = "synthetic-github-token"
 
 
 def test_valid_configuration():
@@ -161,6 +162,91 @@ def test_management_token_is_redacted_in_settings_representation():
 
     representation = repr(settings)
     assert MANAGEMENT_TOKEN not in representation
+    assert "**********" in representation
+
+
+def test_github_reconciliation_is_disabled_by_default_and_token_is_optional():
+    settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
+
+    assert settings.github_reconciliation_enabled is False
+    assert settings.github_repository_webhook_token is None
+    assert settings.github_api_timeout_seconds == 5
+    assert settings.github_reconciliation_max_pages == 5
+
+
+def test_github_token_presence_alone_does_not_enable_reconciliation():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        github_repository_webhook_token=GITHUB_TOKEN,
+        _env_file=None,
+    )
+
+    assert settings.github_reconciliation_enabled is False
+    assert settings.github_repository_webhook_token is not None
+
+
+def test_github_reconciliation_requires_management_api_enabled():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            github_reconciliation_enabled=True,
+            github_repository_webhook_token=GITHUB_TOKEN,
+            _env_file=None,
+        )
+
+    message = str(exc_info.value)
+    assert "MANAGEMENT_API_ENABLED=true is required" in message
+    assert GITHUB_TOKEN not in message
+
+
+def test_github_reconciliation_requires_repository_webhook_token_when_enabled():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_api_token=MANAGEMENT_TOKEN,
+            github_reconciliation_enabled=True,
+            _env_file=None,
+        )
+
+    assert "GITHUB_REPOSITORY_WEBHOOK_TOKEN is required" in str(exc_info.value)
+
+
+def test_github_reconciliation_accepts_enabled_management_and_token():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token=GITHUB_TOKEN,
+        _env_file=None,
+    )
+
+    assert settings.github_reconciliation_enabled is True
+    assert settings.github_repository_webhook_token.get_secret_value() == GITHUB_TOKEN
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_github_api_timeout_must_be_positive(value):
+    with pytest.raises(ValidationError):
+        Settings(webhook_secret="synthetic-secret", github_api_timeout_seconds=value, _env_file=None)
+
+
+@pytest.mark.parametrize("value", [0, 21])
+def test_github_reconciliation_max_pages_range(value):
+    with pytest.raises(ValidationError):
+        Settings(webhook_secret="synthetic-secret", github_reconciliation_max_pages=value, _env_file=None)
+
+
+def test_github_repository_webhook_token_is_redacted_in_settings_representation():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        github_repository_webhook_token=GITHUB_TOKEN,
+        _env_file=None,
+    )
+
+    representation = repr(settings)
+    assert GITHUB_TOKEN not in representation
     assert "**********" in representation
 
 
