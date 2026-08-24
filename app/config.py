@@ -1,11 +1,15 @@
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, PositiveInt, SecretStr
+from pydantic import Field, PositiveInt, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.persistence.database import POSTGRESQL_PSYCOPG_SCHEME
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
+DeliveryStoreBackend = Literal["memory", "postgresql"]
 
 
 class Settings(BaseSettings):
@@ -19,3 +23,17 @@ class Settings(BaseSettings):
     webhook_secret: SecretStr = Field(min_length=1)
     max_events: PositiveInt = 50
     max_webhook_body_bytes: PositiveInt = 26_214_400
+    delivery_store_backend: DeliveryStoreBackend = "memory"
+    database_url: SecretStr | None = None
+    database_connect_timeout_seconds: PositiveInt = 5
+
+    @model_validator(mode="after")
+    def validate_database_runtime(self) -> "Settings":
+        if self.delivery_store_backend != "postgresql":
+            return self
+        if self.database_url is None:
+            raise ValueError("DATABASE_URL is required when DELIVERY_STORE_BACKEND=postgresql")
+        database_url = self.database_url.get_secret_value()
+        if not database_url.startswith(POSTGRESQL_PSYCOPG_SCHEME):
+            raise ValueError("DATABASE_URL must use postgresql+psycopg when DELIVERY_STORE_BACKEND=postgresql")
+        return self

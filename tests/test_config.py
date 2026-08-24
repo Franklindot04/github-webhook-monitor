@@ -84,6 +84,108 @@ def test_database_url_environment_variable_coexists_with_application_settings(mo
     assert settings.webhook_secret.get_secret_value() == "synthetic-env-secret"
     assert settings.max_events == 12
     assert settings.max_webhook_body_bytes == 2048
+    assert settings.delivery_store_backend == "memory"
+
+
+def test_default_delivery_store_backend_is_memory():
+    settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
+
+    assert settings.delivery_store_backend == "memory"
+
+
+def test_explicit_memory_backend_does_not_require_database_url():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="memory",
+        _env_file=None,
+    )
+
+    assert settings.delivery_store_backend == "memory"
+    assert settings.database_url is None
+
+
+def test_explicit_memory_backend_allows_database_url():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="memory",
+        database_url="postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+        _env_file=None,
+    )
+
+    assert settings.delivery_store_backend == "memory"
+    assert settings.database_url is not None
+
+
+def test_postgresql_backend_requires_database_url():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            delivery_store_backend="postgresql",
+            _env_file=None,
+        )
+
+    message = str(exc_info.value)
+    assert "DATABASE_URL is required" in message
+    assert "example_password" not in message
+
+
+def test_postgresql_backend_accepts_psycopg_database_url():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="postgresql",
+        database_url="postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+        _env_file=None,
+    )
+
+    assert settings.delivery_store_backend == "postgresql"
+    assert settings.database_url is not None
+    assert settings.database_url.get_secret_value().startswith("postgresql+psycopg://")
+
+
+def test_invalid_delivery_store_backend_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            delivery_store_backend="sqlite",
+            _env_file=None,
+        )
+
+
+def test_postgresql_backend_rejects_unsupported_database_driver_without_leaking_url():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            delivery_store_backend="postgresql",
+            database_url="postgresql://example_user:example_password@example-host:5432/example_database",
+            _env_file=None,
+        )
+
+    message = str(exc_info.value)
+    assert "postgresql+psycopg" in message
+    assert "example_password" not in message
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_database_connect_timeout_must_be_positive(timeout):
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            database_connect_timeout_seconds=timeout,
+            _env_file=None,
+        )
+
+
+def test_database_url_is_redacted_in_settings_representation():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        database_url="postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+        _env_file=None,
+    )
+
+    representation = repr(settings)
+    assert "example_password" not in representation
+    assert "postgresql+psycopg://" not in representation
+    assert "**********" in representation
 
 
 @pytest.mark.parametrize("max_webhook_body_bytes", [0, -1])
@@ -184,6 +286,8 @@ def test_app_import_succeeds_with_unavailable_database_url_without_connecting():
     env["WEBHOOK_SECRET"] = "synthetic-import-secret"
     env["MAX_EVENTS"] = "5"
     env["MAX_WEBHOOK_BODY_BYTES"] = "1024"
+    env["DELIVERY_STORE_BACKEND"] = "postgresql"
+    env["DATABASE_CONNECT_TIMEOUT_SECONDS"] = "1"
     env["DATABASE_URL"] = "postgresql+psycopg://example_user:example_password@127.0.0.1:1/example_database"
 
     result = subprocess.run(

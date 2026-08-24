@@ -1,11 +1,14 @@
+from collections.abc import Callable
+
 from fastapi import APIRouter, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from app.services.webhooks import (
     InvalidWebhookSignatureError,
     MalformedWebhookPayloadError,
     WebhookIngestionService,
 )
-from app.storage.deliveries import DeliveryStore
+from app.storage.deliveries import DeliveryStore, DeliveryStoreError, DeliveryStoreReadinessError
 
 
 async def read_bounded_body(request: Request, max_body_bytes: int) -> bytes:
@@ -78,6 +81,7 @@ def validate_installation_target(
 def create_router(
     webhook_service: WebhookIngestionService,
     delivery_store: DeliveryStore,
+    readiness_check: Callable[[], None],
     max_webhook_body_bytes: int,
 ) -> APIRouter:
     router = APIRouter()
@@ -86,9 +90,21 @@ def create_router(
     def health():
         return {"status": "ok"}
 
+    @router.get("/ready")
+    async def ready():
+        try:
+            await run_in_threadpool(readiness_check)
+        except DeliveryStoreReadinessError:
+            raise HTTPException(status_code=503, detail="Service unavailable")
+        return {"status": "ready"}
+
     @router.get("/events")
-    def get_events():
-        events = [event.to_dict() for event in delivery_store.list_recent()]
+    async def get_events():
+        try:
+            recent_events = await run_in_threadpool(delivery_store.list_recent)
+        except DeliveryStoreError:
+            raise HTTPException(status_code=503, detail="Service unavailable")
+        events = [event.to_dict() for event in recent_events]
         return {"count": len(events), "events": events}
 
     @router.post("/webhook/github")
@@ -118,7 +134,8 @@ def create_router(
         raw_body = await read_bounded_body(request, max_webhook_body_bytes)
 
         try:
-            event = webhook_service.ingest(
+            event = await run_in_threadpool(
+                webhook_service.ingest,
                 raw_body=raw_body,
                 signature=x_hub_signature_256,
                 github_event=github_event,
@@ -131,6 +148,8 @@ def create_router(
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
         except MalformedWebhookPayloadError:
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        except DeliveryStoreError:
+            raise HTTPException(status_code=503, detail="Service unavailable")
 
         return {"message": "Webhook received", "event": event.to_dict()}
 

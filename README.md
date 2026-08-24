@@ -2,7 +2,7 @@
 
 A lightweight FastAPI service for receiving, validating, and inspecting GitHub webhook deliveries.
 
-This project is a small GitHub integration MVP built around secure webhook ingestion. It validates incoming deliveries using `X-Hub-Signature-256`, stores a capped in-memory ledger of recent observed delivery attempts, and exposes simple endpoints for health checks and event inspection. The core focus is secure webhook validation and lightweight delivery visibility.
+This project is a small GitHub integration MVP built around secure webhook ingestion. It validates incoming deliveries using `X-Hub-Signature-256`, stores recent observed delivery attempts in the selected delivery-store backend, and exposes simple endpoints for liveness, readiness, and event inspection. The default backend remains an in-memory ledger for local development.
 
 ## Live project page
 
@@ -17,8 +17,9 @@ https://franklindot04.github.io/github-webhook-monitor/
 - Require GitHub delivery metadata such as event name, delivery ID, and hook ID.
 - Reject unsupported media types, oversized payloads, and invalid delivery metadata before ingestion.
 - Reject invalid deliveries with `401 Unauthorized`.
-- Store a capped in-memory ledger of recent observed delivery attempts for quick inspection.
-- Expose a health endpoint for smoke checks.
+- Store recent observed delivery attempts for quick inspection, using memory by default or PostgreSQL when explicitly selected.
+- Expose a health endpoint for liveness smoke checks.
+- Expose a readiness endpoint for runtime dependency checks.
 - Expose an events endpoint for viewing recently received payload summaries.
 
 ## Project structure
@@ -81,6 +82,7 @@ github-webhook-monitor/
    WEBHOOK_SECRET=replace-with-a-long-random-development-secret
    MAX_EVENTS=50
    MAX_WEBHOOK_BODY_BYTES=26214400
+   DELIVERY_STORE_BACKEND=memory
    ```
 
 ## Tech stack
@@ -102,6 +104,7 @@ uv run --locked uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Once the server is running, you can open:
 
 - `http://127.0.0.1:8000/health`
+- `http://127.0.0.1:8000/ready`
 - `http://127.0.0.1:8000/events`
 - `http://127.0.0.1:8000/docs`
 
@@ -109,7 +112,8 @@ Once the server is running, you can open:
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/health` | Health check endpoint |
+| GET | `/health` | Liveness check endpoint |
+| GET | `/ready` | Runtime dependency readiness endpoint |
 | GET | `/events` | Returns recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
@@ -190,6 +194,7 @@ If you are testing locally, you can expose your development server with a tunnel
 
 - Never commit your real `.env` file.
 - Keep `WEBHOOK_SECRET` private.
+- Keep credential-bearing `DATABASE_URL` values private.
 - Configure GitHub webhooks with `application/json` payloads.
 - The receiver validates `X-Hub-Signature-256`; the legacy SHA-1 signature header is not accepted as a substitute.
 - `MAX_WEBHOOK_BODY_BYTES` bounds accepted request bodies and defaults to `26214400` bytes.
@@ -203,26 +208,42 @@ GitHub's `X-GitHub-Delivery` value identifies the logical upstream delivery. Thi
 
 Repeated GitHub delivery IDs are retained as separate observed attempts rather than rejected or classified immediately. The in-memory ledger keeps bounded recent attempt metadata, including a SHA-256 digest of the exact accepted payload bytes, but it does not retain full raw payload bodies long term.
 
-`MAX_EVENTS` keeps its existing operator-facing name and now bounds the number of recent observed delivery attempts retained by the in-memory ledger.
+`MAX_EVENTS` keeps its existing operator-facing name. With the memory backend, it bounds the retained in-process ledger. With the PostgreSQL backend, it limits the recent attempts returned by `/events`; it does not delete durable rows.
 
 The `/events` endpoint remains available and preserves the existing event fields. It also includes additive attempt metadata such as `attempt_id` and `payload_sha256` for operational comparison.
 
-Replay detection, redelivery classification, idempotency, and durable payload retention are deferred until a persistence model exists.
+Replay detection, redelivery classification, idempotency, and durable payload retention are still deferred.
 
-## PostgreSQL persistence foundation
+## Runtime persistence
 
-The project includes a PostgreSQL delivery-store adapter and Alembic migration foundation. The application still defaults to the in-memory delivery ledger; PostgreSQL is not selected automatically at runtime yet.
+The application defaults to the in-memory delivery ledger:
 
-Migration and database tooling use `DATABASE_URL` with the `postgresql+psycopg://` driver form:
+```env
+DELIVERY_STORE_BACKEND=memory
+```
+
+PostgreSQL runtime persistence is selected only when explicitly configured:
+
+```env
+DELIVERY_STORE_BACKEND=postgresql
+DATABASE_URL=postgresql+psycopg://example_user:example_password@example-host:5432/example_database
+DATABASE_CONNECT_TIMEOUT_SECONDS=5
+```
+
+`DATABASE_URL` is optional for memory mode and required for PostgreSQL mode. PostgreSQL runtime mode requires the synchronous Psycopg SQLAlchemy driver form, `postgresql+psycopg://`.
+
+Migrations are operationally explicit. Apply the Alembic migration before starting the app in PostgreSQL mode:
 
 ```bash
 DATABASE_URL=postgresql+psycopg://example_user:example_password@example-host:5432/example_database \
 uv run --locked alembic upgrade head
 ```
 
+The app does not run migrations automatically, does not call `metadata.create_all()`, and does not silently fall back to memory when PostgreSQL is selected. PostgreSQL startup fails if the database is unreachable or the delivery-ledger schema is unavailable.
+
 The PostgreSQL schema stores logical GitHub deliveries separately from observed delivery attempts. It persists attempt metadata and `payload_sha256`, but it does not persist full raw webhook request bodies.
 
-`MAX_EVENTS` continues to bound only the current in-memory recent-attempt window. Durable PostgreSQL retention policy and runtime database selection are deferred to later stages.
+`GET /health` is a process liveness check and does not query PostgreSQL. `GET /ready` checks runtime dependency readiness: memory mode returns ready without database access, while PostgreSQL mode verifies database connectivity and required delivery-ledger schema usability. If PostgreSQL persistence is unavailable during request handling, `POST /webhook/github` and `GET /events` return `503 Service Unavailable` with a generic response rather than acknowledging or returning misleading data.
 
 ## Repository files
 
