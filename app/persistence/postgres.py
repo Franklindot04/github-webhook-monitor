@@ -3,10 +3,11 @@ from typing import Any
 
 from sqlalchemy import Engine, Select, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
 from app.persistence.schema import delivery_attempts, github_deliveries
-from app.storage.deliveries import DeliveryStore
+from app.storage.deliveries import DeliveryStore, DeliveryStoreError
 
 
 def _installation_target_id_to_db(value: str | None) -> int | None:
@@ -69,37 +70,43 @@ class PostgresDeliveryStore(DeliveryStore):
         self._list_limit = list_limit
 
     def add(self, attempt: DeliveryAttempt) -> None:
-        with self._engine.begin() as connection:
-            insert_delivery = (
-                insert(github_deliveries)
-                .values(delivery_identity_values(attempt))
-                .on_conflict_do_nothing(
-                    index_elements=[
-                        github_deliveries.c.delivery_guid,
-                        github_deliveries.c.hook_id,
-                    ]
-                )
-                .returning(github_deliveries.c.id)
-            )
-            github_delivery_id = connection.execute(insert_delivery).scalar_one_or_none()
-            if github_delivery_id is None:
-                github_delivery_id = connection.execute(
-                    select(github_deliveries.c.id).where(
-                        github_deliveries.c.delivery_guid == attempt.delivery_identity.delivery_guid,
-                        github_deliveries.c.hook_id == attempt.delivery_identity.hook_id,
+        try:
+            with self._engine.begin() as connection:
+                insert_delivery = (
+                    insert(github_deliveries)
+                    .values(delivery_identity_values(attempt))
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            github_deliveries.c.delivery_guid,
+                            github_deliveries.c.hook_id,
+                        ]
                     )
-                ).scalar_one()
-
-            connection.execute(
-                insert(delivery_attempts).values(
-                    delivery_attempt_values(attempt, github_delivery_id=github_delivery_id)
+                    .returning(github_deliveries.c.id)
                 )
-            )
+                github_delivery_id = connection.execute(insert_delivery).scalar_one_or_none()
+                if github_delivery_id is None:
+                    github_delivery_id = connection.execute(
+                        select(github_deliveries.c.id).where(
+                            github_deliveries.c.delivery_guid == attempt.delivery_identity.delivery_guid,
+                            github_deliveries.c.hook_id == attempt.delivery_identity.hook_id,
+                        )
+                    ).scalar_one()
+
+                connection.execute(
+                    insert(delivery_attempts).values(
+                        delivery_attempt_values(attempt, github_delivery_id=github_delivery_id)
+                    )
+                )
+        except SQLAlchemyError as exc:
+            raise DeliveryStoreError("Delivery store operation failed") from exc
 
     def list_recent(self) -> list[DeliveryAttempt]:
         statement = _recent_attempts_statement(self._list_limit)
-        with self._engine.connect() as connection:
-            rows = connection.execute(statement).mappings().all()
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(statement).mappings().all()
+        except SQLAlchemyError as exc:
+            raise DeliveryStoreError("Delivery store operation failed") from exc
         return [row_to_delivery_attempt(row) for row in rows]
 
 

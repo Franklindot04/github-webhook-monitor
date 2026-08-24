@@ -1,15 +1,36 @@
 import hashlib
 import hmac
+import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
+import app.runtime as app_runtime
 from app.config import Settings
 from app.factory import create_app
-from app.storage.deliveries import InMemoryDeliveryStore
+from app.storage.deliveries import DeliveryStoreReadinessError, InMemoryDeliveryStore
 
 
 def signature_for(payload: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def synthetic_postgresql_settings() -> Settings:
+    return Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="postgresql",
+        database_url="postgresql+psycopg://example_user:example_password@example-host:5432/example_database",
+        database_connect_timeout_seconds=2,
+        _env_file=None,
+    )
+
+
+def has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def test_independently_constructed_apps_do_not_share_events():
@@ -90,3 +111,164 @@ def test_injected_delivery_store_is_used_for_ingestion_and_listing():
     stored_events = [event.to_dict() for event in delivery_store.list_recent()]
     assert stored_events == [response.json()["event"]]
     assert client.get("/events").json() == {"count": 1, "events": stored_events}
+
+
+def test_memory_runtime_does_not_create_database_engine():
+    settings = Settings(webhook_secret="synthetic-secret", delivery_store_backend="memory", _env_file=None)
+    app = create_app(settings=settings)
+
+    assert isinstance(app.state.delivery_store, InMemoryDeliveryStore)
+    assert app.state.runtime_resources.engine is None
+    assert app.state.runtime_resources.owns_engine is False
+
+
+def test_postgresql_runtime_builds_one_owned_engine_and_disposes_it(monkeypatch):
+    created_engines = []
+    readiness_checks = []
+
+    class FakeEngine:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    def create_fake_engine(database_url, *, connect_timeout_seconds, pool_pre_ping):
+        engine = FakeEngine()
+        created_engines.append((engine, database_url, connect_timeout_seconds, pool_pre_ping))
+        return engine
+
+    def fake_readiness_check(engine):
+        readiness_checks.append(engine)
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", create_fake_engine)
+    monkeypatch.setattr(app_runtime, "verify_delivery_store_ready", fake_readiness_check)
+    settings = synthetic_postgresql_settings()
+    app_instance = create_app(settings=settings)
+
+    assert len(created_engines) == 1
+    engine, database_url, timeout, pool_pre_ping = created_engines[0]
+    assert database_url == settings.database_url.get_secret_value()
+    assert timeout == 2
+    assert pool_pre_ping is True
+    assert app_instance.state.runtime_resources.engine is engine
+    assert app_instance.state.runtime_resources.owns_engine is True
+
+    with TestClient(app_instance):
+        assert readiness_checks == [engine]
+        assert engine.disposed is False
+
+    assert engine.disposed is True
+
+
+def test_injected_delivery_store_does_not_create_or_dispose_engine(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("database engine should not be created for injected stores")
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", fail_if_called)
+    delivery_store = InMemoryDeliveryStore(max_events=10)
+    settings = synthetic_postgresql_settings()
+    app_instance = create_app(settings=settings, delivery_store=delivery_store)
+
+    with TestClient(app_instance):
+        assert app_instance.state.delivery_store is delivery_store
+        assert app_instance.state.runtime_resources.engine is None
+        assert app_instance.state.runtime_resources.owns_engine is False
+
+
+def test_postgresql_lifespan_readiness_runs_outside_active_event_loop(monkeypatch):
+    readiness_ran_without_loop = []
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def create_fake_engine(database_url, *, connect_timeout_seconds, pool_pre_ping):
+        return FakeEngine()
+
+    def fake_readiness_check(engine):
+        readiness_ran_without_loop.append(not has_running_loop())
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", create_fake_engine)
+    monkeypatch.setattr(app_runtime, "verify_delivery_store_ready", fake_readiness_check)
+
+    with TestClient(create_app(settings=synthetic_postgresql_settings())):
+        pass
+
+    assert readiness_ran_without_loop == [True]
+
+
+def test_postgresql_ready_endpoint_readiness_runs_outside_active_event_loop(monkeypatch):
+    readiness_ran_without_loop = []
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def create_fake_engine(database_url, *, connect_timeout_seconds, pool_pre_ping):
+        return FakeEngine()
+
+    def fake_readiness_check(engine):
+        readiness_ran_without_loop.append(not has_running_loop())
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", create_fake_engine)
+    monkeypatch.setattr(app_runtime, "verify_delivery_store_ready", fake_readiness_check)
+
+    with TestClient(create_app(settings=synthetic_postgresql_settings())) as client:
+        readiness_ran_without_loop.clear()
+        response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+    assert readiness_ran_without_loop == [True]
+
+
+def test_postgresql_owned_engine_is_disposed_when_startup_readiness_fails(monkeypatch):
+    created_engines = []
+    request_served = False
+
+    class FakeEngine:
+        def __init__(self):
+            self.dispose_count = 0
+
+        def dispose(self):
+            self.dispose_count += 1
+
+    def create_fake_engine(database_url, *, connect_timeout_seconds, pool_pre_ping):
+        engine = FakeEngine()
+        created_engines.append(engine)
+        return engine
+
+    def fake_readiness_check(engine):
+        raise DeliveryStoreReadinessError("synthetic readiness failure")
+
+    monkeypatch.setattr(app_runtime, "create_database_engine", create_fake_engine)
+    monkeypatch.setattr(app_runtime, "verify_delivery_store_ready", fake_readiness_check)
+    app = create_app(settings=synthetic_postgresql_settings())
+
+    with pytest.raises(DeliveryStoreReadinessError):
+        with TestClient(app) as client:
+            request_served = True
+            client.get("/health")
+
+    assert len(created_engines) == 1
+    assert created_engines[0].dispose_count == 1
+    assert request_served is False
+    assert app.state.runtime_resources.owns_engine is True
+
+
+def test_postgresql_runtime_unavailable_database_fails_lifespan_without_memory_fallback():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        delivery_store_backend="postgresql",
+        database_url="postgresql+psycopg://example_user:example_password@127.0.0.1:1/example_database",
+        database_connect_timeout_seconds=1,
+        _env_file=None,
+    )
+    app = create_app(settings=settings)
+
+    with pytest.raises(DeliveryStoreReadinessError):
+        with TestClient(app):
+            pass
+
+    assert not isinstance(app.state.delivery_store, InMemoryDeliveryStore)

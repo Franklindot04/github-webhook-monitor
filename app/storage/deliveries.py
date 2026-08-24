@@ -4,6 +4,14 @@ from typing import Protocol
 from app.domain.deliveries import DeliveryAttempt
 
 
+class DeliveryStoreError(Exception):
+    pass
+
+
+class DeliveryStoreReadinessError(Exception):
+    pass
+
+
 class DeliveryStore(Protocol):
     def add(self, attempt: DeliveryAttempt) -> None:
         ...

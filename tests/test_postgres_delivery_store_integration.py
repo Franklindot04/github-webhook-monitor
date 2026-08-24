@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
 from app.persistence.postgres import PostgresDeliveryStore
 from app.persistence.schema import delivery_attempts, github_deliveries
+from app.storage.deliveries import DeliveryStoreError
 
 
 pytestmark = pytest.mark.integration
@@ -254,8 +255,9 @@ def test_duplicate_attempt_id_is_rejected(engine):
     attempt = make_attempt("00000000-0000-0000-0000-000000000001")
 
     store.add(attempt)
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DeliveryStoreError) as exc_info:
         store.add(attempt)
+    assert isinstance(exc_info.value.__cause__, IntegrityError)
 
 
 def test_failed_attempt_insert_does_not_leave_new_logical_delivery(engine):
@@ -274,8 +276,9 @@ def test_failed_attempt_insert_does_not_leave_new_logical_delivery(engine):
         installation_target_type="repository",
     )
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DeliveryStoreError) as exc_info:
         store.add(invalid_attempt)
+    assert isinstance(exc_info.value.__cause__, IntegrityError)
 
     with engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(github_deliveries)).scalar_one() == 0

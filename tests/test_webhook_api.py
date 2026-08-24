@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -12,7 +13,7 @@ from fastapi import HTTPException
 from app.api.routes import is_json_content_type, read_bounded_body, validate_content_length
 from app.config import Settings
 from app.factory import create_app
-from app.storage.deliveries import InMemoryDeliveryStore
+from app.storage.deliveries import DeliveryStoreError, InMemoryDeliveryStore
 
 
 TEST_SECRET = "test-webhook-secret"
@@ -60,6 +61,13 @@ def test_health_endpoint_contract(client):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_ready_endpoint_reports_memory_runtime_ready(client):
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
 
 
 def test_valid_signed_webhook_stores_and_returns_event_metadata(client, delivery_store):
@@ -372,6 +380,89 @@ def test_events_endpoint_exposes_current_in_memory_collection(client):
     assert webhook_response.status_code == 200
     assert events_response.status_code == 200
     assert events_response.json() == {"count": 1, "events": [webhook_response.json()["event"]]}
+
+
+class FailingDeliveryStore:
+    max_events = 50
+
+    def add(self, attempt):
+        raise DeliveryStoreError("synthetic storage failure")
+
+    def list_recent(self):
+        raise DeliveryStoreError("synthetic storage failure")
+
+
+def test_valid_webhook_returns_service_unavailable_when_persistence_fails():
+    store = FailingDeliveryStore()
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+    payload = encode_json({"action": "opened"})
+
+    response = post_webhook(client, payload)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service unavailable"}
+
+
+def test_invalid_signature_does_not_become_persistence_failure():
+    store = FailingDeliveryStore()
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+    payload = encode_json({"action": "opened"})
+
+    response = post_webhook(client, payload, {"X-Hub-Signature-256": "sha256=bad"})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid webhook signature"}
+
+
+def test_events_endpoint_returns_service_unavailable_when_listing_fails():
+    store = FailingDeliveryStore()
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = client.get("/events")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service unavailable"}
+
+
+class LoopRecordingDeliveryStore:
+    def __init__(self):
+        self.add_ran_without_active_loop: bool | None = None
+        self.list_ran_without_active_loop: bool | None = None
+        self._store = InMemoryDeliveryStore(max_events=50)
+
+    def add(self, attempt):
+        self.add_ran_without_active_loop = not _has_running_loop()
+        self._store.add(attempt)
+
+    def list_recent(self):
+        self.list_ran_without_active_loop = not _has_running_loop()
+        return self._store.list_recent()
+
+
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_webhook_and_events_store_calls_run_outside_active_event_loop():
+    store = LoopRecordingDeliveryStore()
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+    payload = encode_json({"action": "opened"})
+
+    webhook_response = post_webhook(client, payload)
+    events_response = client.get("/events")
+
+    assert webhook_response.status_code == 200
+    assert events_response.status_code == 200
+    assert store.add_ran_without_active_loop is True
+    assert store.list_ran_without_active_loop is True
 
 
 def test_delivery_store_respects_configured_maximum_length(client, delivery_store):
