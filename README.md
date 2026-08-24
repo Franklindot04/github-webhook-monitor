@@ -20,7 +20,7 @@ https://franklindot04.github.io/github-webhook-monitor/
 - Store recent observed delivery attempts for quick inspection, using memory by default or PostgreSQL when explicitly selected.
 - Expose a health endpoint for liveness smoke checks.
 - Expose a readiness endpoint for runtime dependency checks.
-- Expose an events endpoint for viewing recently received payload summaries.
+- Expose an authenticated management endpoint for viewing recently received payload summaries.
 
 ## Project structure
 
@@ -83,6 +83,7 @@ github-webhook-monitor/
    MAX_EVENTS=50
    MAX_WEBHOOK_BODY_BYTES=26214400
    DELIVERY_STORE_BACKEND=memory
+   MANAGEMENT_API_ENABLED=false
    ```
 
 ## Tech stack
@@ -114,8 +115,23 @@ Once the server is running, you can open:
 |---|---|---|
 | GET | `/health` | Liveness check endpoint |
 | GET | `/ready` | Runtime dependency readiness endpoint |
-| GET | `/events` | Returns recent stored webhook delivery attempt summaries |
+| GET | `/events` | Management endpoint for recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
+
+## Endpoint classes
+
+Public runtime endpoints:
+
+- `GET /health`
+- `GET /ready`
+
+Webhook ingress:
+
+- `POST /webhook/github`
+
+Management plane:
+
+- `GET /events`
 
 ## Local webhook test
 
@@ -194,6 +210,7 @@ If you are testing locally, you can expose your development server with a tunnel
 
 - Never commit your real `.env` file.
 - Keep `WEBHOOK_SECRET` private.
+- Keep `MANAGEMENT_API_TOKEN` private and separate from `WEBHOOK_SECRET`.
 - Keep credential-bearing `DATABASE_URL` values private.
 - Configure GitHub webhooks with `application/json` payloads.
 - The receiver validates `X-Hub-Signature-256`; the legacy SHA-1 signature header is not accepted as a substitute.
@@ -201,6 +218,7 @@ If you are testing locally, you can expose your development server with a tunnel
 - Validate the signature before processing any payload.
 - Reject invalid deliveries immediately.
 - Avoid placing secrets or credentials in the payload URL.
+- Generate production management tokens as high-entropy operator credentials using an appropriate secret-management process.
 
 ## Delivery ledger model
 
@@ -210,7 +228,7 @@ Repeated GitHub delivery IDs are retained as separate observed attempts rather t
 
 `MAX_EVENTS` keeps its existing operator-facing name. With the memory backend, it bounds the retained in-process ledger. With the PostgreSQL backend, it limits the recent attempts returned by `/events`; it does not delete durable rows.
 
-The `/events` endpoint remains available and preserves the existing event fields. It also includes additive attempt metadata such as `attempt_id` and `payload_sha256` for operational comparison.
+The `/events` endpoint preserves the existing event fields when management access is enabled and authenticated. It also includes additive attempt metadata such as `attempt_id` and `payload_sha256` for operational comparison.
 
 Replay detection, redelivery classification, idempotency, and durable payload retention are still deferred.
 
@@ -244,6 +262,31 @@ The app does not run migrations automatically, does not call `metadata.create_al
 The PostgreSQL schema stores logical GitHub deliveries separately from observed delivery attempts. It persists attempt metadata and `payload_sha256`, but it does not persist full raw webhook request bodies.
 
 `GET /health` is a process liveness check and does not query PostgreSQL. `GET /ready` checks runtime dependency readiness: memory mode returns ready without database access, while PostgreSQL mode verifies database connectivity and required delivery-ledger schema usability. If PostgreSQL persistence is unavailable during request handling, `POST /webhook/github` and `GET /events` return `503 Service Unavailable` with a generic response rather than acknowledging or returning misleading data.
+
+## Management access
+
+Management APIs are disabled by default:
+
+```env
+MANAGEMENT_API_ENABLED=false
+```
+
+When disabled, management endpoints such as `GET /events` return `404 Not Found`. Webhook ingress, liveness, and readiness remain available according to their own contracts.
+
+To enable the management plane, configure both:
+
+```env
+MANAGEMENT_API_ENABLED=true
+MANAGEMENT_API_TOKEN=replace-with-a-high-entropy-management-token-000001
+```
+
+`MANAGEMENT_API_TOKEN` must be at least 32 characters. When management access is enabled, callers must send:
+
+```text
+Authorization: Bearer <management-token>
+```
+
+Missing, malformed, or incorrect bearer credentials return `401 Unauthorized` with a generic response. The GitHub webhook secret does not authenticate management endpoints, and the management bearer token does not authenticate webhook ingress. The current bearer-token boundary is a management-plane authentication foundation; future production authorization concerns such as OIDC, SSO, multiple operators, roles, scopes, and audit identity are intentionally deferred.
 
 ## Repository files
 

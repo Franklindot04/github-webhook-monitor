@@ -21,6 +21,7 @@ pytestmark = pytest.mark.integration
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 TEST_SECRET = "test-webhook-secret"
+MANAGEMENT_TOKEN = "synthetic-management-token-000001"
 
 
 def require_test_database_url() -> str:
@@ -67,6 +68,8 @@ def runtime_settings(database_url: str) -> Settings:
         delivery_store_backend="postgresql",
         database_url=database_url,
         database_connect_timeout_seconds=2,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
         _env_file=None,
     )
 
@@ -77,6 +80,10 @@ def encode_json(value: object) -> bytes:
 
 def signature_for(payload: bytes, secret: str = TEST_SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def management_headers(token: str = MANAGEMENT_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
 def post_webhook(
@@ -129,10 +136,12 @@ def test_http_webhook_persists_to_postgresql_and_events_reads_database(
 
     with TestClient(create_app(settings=runtime_settings(database_url))) as client:
         response = post_webhook(client, payload)
-        events_response = client.get("/events")
+        unauthenticated_events_response = client.get("/events")
+        events_response = client.get("/events", headers=management_headers())
 
     assert response.status_code == 200
     assert response.json()["message"] == "Webhook received"
+    assert unauthenticated_events_response.status_code == 401
     assert events_response.status_code == 200
     assert events_response.json()["events"] == [response.json()["event"]]
 
@@ -156,7 +165,7 @@ def test_postgresql_runtime_persists_events_across_application_restart(
         assert first_response.status_code == 200
 
     with TestClient(create_app(settings=runtime_settings(database_url))) as second_client:
-        events_response = second_client.get("/events")
+        events_response = second_client.get("/events", headers=management_headers())
 
     assert events_response.status_code == 200
     assert events_response.json()["count"] == 1
@@ -179,7 +188,7 @@ def test_postgresql_runtime_handles_concurrent_http_webhooks_for_same_delivery(
                 executor.submit(post_webhook, client, second_payload, delivery_id="delivery-race"),
             ]
             responses = [future.result(timeout=10) for future in futures]
-        events = client.get("/events").json()["events"]
+        events = client.get("/events", headers=management_headers()).json()["events"]
 
     assert [response.status_code for response in responses] == [200, 200]
     assert len(events) == 2
@@ -222,10 +231,13 @@ def test_postgresql_runtime_reports_service_unavailable_when_database_disappears
         payload = encode_json({"action": "opened"})
 
         post_response = post_webhook(client, payload)
-        events_response = client.get("/events")
+        events_response = client.get("/events", headers=management_headers())
+
+        unauthenticated_events_response = client.get("/events")
 
     assert post_response.status_code == 503
     assert post_response.json() == {"detail": "Service unavailable"}
     assert events_response.status_code == 503
     assert events_response.json() == {"detail": "Service unavailable"}
+    assert unauthenticated_events_response.status_code == 401
     command.upgrade(alembic_config, "head")

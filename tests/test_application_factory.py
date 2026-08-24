@@ -11,8 +11,15 @@ from app.factory import create_app
 from app.storage.deliveries import DeliveryStoreReadinessError, InMemoryDeliveryStore
 
 
+MANAGEMENT_TOKEN = "synthetic-management-token-000001"
+
+
 def signature_for(payload: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def management_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {MANAGEMENT_TOKEN}"}
 
 
 def synthetic_postgresql_settings() -> Settings:
@@ -35,8 +42,14 @@ def has_running_loop() -> bool:
 
 def test_independently_constructed_apps_do_not_share_events():
     secret = "synthetic-secret"
-    first_client = TestClient(create_app(settings=Settings(webhook_secret=secret, _env_file=None)))
-    second_client = TestClient(create_app(settings=Settings(webhook_secret=secret, _env_file=None)))
+    settings = Settings(
+        webhook_secret=secret,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    first_client = TestClient(create_app(settings=settings))
+    second_client = TestClient(create_app(settings=settings))
     payload = b'{"action":"opened"}'
 
     response = first_client.post(
@@ -52,8 +65,8 @@ def test_independently_constructed_apps_do_not_share_events():
     )
 
     assert response.status_code == 200
-    assert first_client.get("/events").json()["count"] == 1
-    assert second_client.get("/events").json() == {"count": 0, "events": []}
+    assert first_client.get("/events", headers=management_headers()).json()["count"] == 1
+    assert second_client.get("/events", headers=management_headers()).json() == {"count": 0, "events": []}
 
 
 def test_create_app_accepts_explicit_settings_instance():
@@ -65,7 +78,13 @@ def test_create_app_accepts_explicit_settings_instance():
 
 
 def test_create_app_uses_custom_settings_capacity():
-    settings = Settings(webhook_secret="synthetic-secret", max_events=2, _env_file=None)
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        max_events=2,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
     client = TestClient(create_app(settings=settings))
 
     for index in range(3):
@@ -83,7 +102,7 @@ def test_create_app_uses_custom_settings_capacity():
         )
         assert response.status_code == 200
 
-    events = client.get("/events").json()["events"]
+    events = client.get("/events", headers=management_headers()).json()["events"]
     assert len(events) == 2
     assert [event["delivery_id"] for event in events] == ["delivery-2", "delivery-1"]
 
@@ -91,7 +110,12 @@ def test_create_app_uses_custom_settings_capacity():
 def test_injected_delivery_store_is_used_for_ingestion_and_listing():
     secret = "synthetic-secret"
     delivery_store = InMemoryDeliveryStore(max_events=10)
-    settings = Settings(webhook_secret=secret, _env_file=None)
+    settings = Settings(
+        webhook_secret=secret,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
     client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
     payload = b'{"action":"opened","repository":{"full_name":"octo/example"}}'
 
@@ -110,7 +134,7 @@ def test_injected_delivery_store_is_used_for_ingestion_and_listing():
     assert response.status_code == 200
     stored_events = [event.to_dict() for event in delivery_store.list_recent()]
     assert stored_events == [response.json()["event"]]
-    assert client.get("/events").json() == {"count": 1, "events": stored_events}
+    assert client.get("/events", headers=management_headers()).json() == {"count": 1, "events": stored_events}
 
 
 def test_memory_runtime_does_not_create_database_engine():
