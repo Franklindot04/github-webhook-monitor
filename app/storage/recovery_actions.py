@@ -5,7 +5,7 @@ from typing import Protocol
 from uuid import UUID, uuid4
 
 from app.domain.deliveries import DeliveryAttempt
-from app.domain.management import ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
+from app.domain.management import ManagementAuthorization, ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
 from app.domain.recovery_actions import (
     RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
     RECOVERY_ACTION_STATE_INITIATED,
@@ -42,6 +42,7 @@ class RecoveryActionStore(Protocol):
         github_delivery_id: int,
         requested_at: datetime,
         principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
+        authorization: ManagementAuthorization | None = None,
     ) -> RecoveryAction:
         ...
 
@@ -82,6 +83,7 @@ class InMemoryRecoveryActionStore:
         github_delivery_id: int,
         requested_at: datetime,
         principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
+        authorization: ManagementAuthorization | None = None,
     ) -> RecoveryAction:
         action = RecoveryAction(
             action_id=uuid4(),
@@ -97,6 +99,8 @@ class InMemoryRecoveryActionStore:
             principal_issuer=principal.issuer,
             principal_subject=principal.subject,
             principal_client_id=principal.client_id,
+            authorization_capability=authorization.capability if authorization is not None else None,
+            authorization_scope=authorization.matched_scope if authorization is not None else None,
             state=RECOVERY_ACTION_STATE_INITIATED,
             upstream_status_code=None,
             failure_category=None,
@@ -132,6 +136,8 @@ class InMemoryRecoveryActionStore:
                 principal_issuer=action.principal_issuer,
                 principal_subject=action.principal_subject,
                 principal_client_id=action.principal_client_id,
+                authorization_capability=action.authorization_capability,
+                authorization_scope=action.authorization_scope,
                 state=state,
                 upstream_status_code=upstream_status_code,
                 failure_category=failure_category,

@@ -13,7 +13,12 @@ from app.api.v1.models import (
     RecoveryActionsListResponse,
 )
 from app.domain.deliveries import DeliveryAttempt
-from app.domain.management import ManagementPrincipal
+from app.domain.management import (
+    MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ,
+    MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE,
+    MANAGEMENT_CAPABILITY_RECOVERY_READ,
+    ManagementAuthorization,
+)
 from app.domain.recovery_actions import RecoveryAction
 from app.integrations.github.models import GitHubDeliverySummary
 from app.services.delivery_queries import (
@@ -95,6 +100,8 @@ def recovery_action_to_response(action: RecoveryAction) -> RecoveryActionRespons
         principal_issuer=action.principal_issuer,
         principal_subject=action.principal_subject,
         principal_client_id=action.principal_client_id,
+        authorization_capability=action.authorization_capability,
+        authorization_scope=action.authorization_scope,
         state=action.state,
         upstream_status_code=action.upstream_status_code,
         failure_category=action.failure_category,
@@ -104,6 +111,7 @@ def recovery_action_to_response(action: RecoveryAction) -> RecoveryActionRespons
 def create_delivery_attempts_router(
     query_service: DeliveryQueryService,
     management_access_dependency,
+    management_capability_dependency,
     reconciliation_service: GitHubReconciliationService | None = None,
     redelivery_service: GitHubRedeliveryService | None = None,
     recovery_action_query_service: RecoveryActionQueryService | None = None,
@@ -111,11 +119,18 @@ def create_delivery_attempts_router(
     router = APIRouter(
         prefix="/api/v1",
         tags=["management diagnostics"],
-        dependencies=[Depends(management_access_dependency)],
     )
 
-    @router.get("/delivery-attempts", response_model=DeliveryAttemptsListResponse)
+    @router.get(
+        "/delivery-attempts",
+        response_model=DeliveryAttemptsListResponse,
+        description="Requires management capability diagnostics.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
+    )
     async def list_delivery_attempts(
+        _authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ)
+        ),
         limit: str | None = Query(
             default=None,
             description="Page size as an integer from 1 to 100. Defaults to 50.",
@@ -144,8 +159,16 @@ def create_delivery_attempts_router(
             next_cursor=page.next_cursor,
         )
 
-    @router.get("/delivery-attempts/{attempt_id}", response_model=DeliveryAttemptResponse)
+    @router.get(
+        "/delivery-attempts/{attempt_id}",
+        response_model=DeliveryAttemptResponse,
+        description="Requires management capability diagnostics.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
+    )
     async def get_delivery_attempt(
+        _authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ)
+        ),
         attempt_id: str = Path(
             description="Application-owned delivery attempt UUID.",
             json_schema_extra={"format": "uuid"},
@@ -168,8 +191,13 @@ def create_delivery_attempts_router(
         "/delivery-attempts/{attempt_id}/github-deliveries",
         response_model=GitHubDeliveriesReconciliationResponse,
         summary="Reconcile one local delivery attempt with GitHub repository webhook history",
+        description="Requires management capability diagnostics.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
     )
     async def reconcile_github_deliveries(
+        _authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ)
+        ),
         attempt_id: str = Path(
             description="Application-owned delivery attempt UUID.",
             json_schema_extra={"format": "uuid"},
@@ -227,9 +255,13 @@ def create_delivery_attempts_router(
         response_model=GitHubRedeliveryResponse,
         status_code=status.HTTP_202_ACCEPTED,
         summary="Request GitHub to redeliver one verified repository webhook delivery",
+        description="Requires management capability recovery.execute.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
     )
     async def request_github_redelivery(
-        principal: ManagementPrincipal = Depends(management_access_dependency),
+        authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE)
+        ),
         attempt_id: str = Path(
             description="Application-owned delivery attempt UUID.",
             json_schema_extra={"format": "uuid"},
@@ -262,7 +294,7 @@ def create_delivery_attempts_router(
             result = await redelivery_service.request_redelivery(
                 attempt=attempt,
                 github_delivery_id=parsed_github_delivery_id,
-                principal=principal,
+                authorization=authorization,
             )
         except GitHubRedeliveryDisabledError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
@@ -297,8 +329,16 @@ def create_delivery_attempts_router(
             status=result.status,
         )
 
-    @router.get("/recovery-actions", response_model=RecoveryActionsListResponse)
+    @router.get(
+        "/recovery-actions",
+        response_model=RecoveryActionsListResponse,
+        description="Requires management capability recovery.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
+    )
     async def list_recovery_actions(
+        _authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_RECOVERY_READ)
+        ),
         limit: str | None = Query(
             default=None,
             description="Page size as an integer from 1 to 100. Defaults to 50.",
@@ -329,8 +369,16 @@ def create_delivery_attempts_router(
             next_cursor=page.next_cursor,
         )
 
-    @router.get("/recovery-actions/{action_id}", response_model=RecoveryActionResponse)
+    @router.get(
+        "/recovery-actions/{action_id}",
+        response_model=RecoveryActionResponse,
+        description="Requires management capability recovery.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
+    )
     async def get_recovery_action(
+        _authorization: ManagementAuthorization = Depends(
+            management_capability_dependency(MANAGEMENT_CAPABILITY_RECOVERY_READ)
+        ),
         action_id: str = Path(
             description="Application-owned recovery action UUID.",
             json_schema_extra={"format": "uuid"},

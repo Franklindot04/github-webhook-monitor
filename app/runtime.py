@@ -89,6 +89,8 @@ def verify_delivery_store_ready(engine: Engine) -> None:
                     recovery_actions.c.principal_issuer,
                     recovery_actions.c.principal_subject,
                     recovery_actions.c.principal_client_id,
+                    recovery_actions.c.authorization_capability,
+                    recovery_actions.c.authorization_scope,
                     recovery_actions.c.state,
                     recovery_actions.c.upstream_status_code,
                     recovery_actions.c.failure_category,

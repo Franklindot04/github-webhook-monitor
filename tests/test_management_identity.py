@@ -8,6 +8,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.domain.management import (
+    MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ,
+    MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE,
+    MANAGEMENT_CAPABILITY_RECOVERY_READ,
+    ManagementPrincipal,
+    ManagementScopePolicy,
+)
 from app.factory import create_app
 from app.security import (
     InsufficientManagementScopeError,
@@ -15,15 +22,26 @@ from app.security import (
     ManagementIdentityProviderUnavailableError,
     OidcJwtConfig,
     OidcJwtManagementAuthenticator,
+    authorize_management_capability,
 )
 from app.storage.deliveries import InMemoryDeliveryStore
+from app.storage.recovery_actions import InMemoryRecoveryActionStore
 
 
 ISSUER = "https://identity.example.com/"
 AUDIENCE = "https://github-webhook-monitor.example/"
 REQUIRED_SCOPE = "webhook-monitor.manage"
+DIAGNOSTICS_READ_SCOPE = "webhook-monitor.diagnostics.read"
+RECOVERY_READ_SCOPE = "webhook-monitor.recovery.read"
+RECOVERY_EXECUTE_SCOPE = "webhook-monitor.recovery.execute"
 TEST_SECRET = "test-webhook-secret"
 MANAGEMENT_TOKEN = "synthetic-management-token-000001"
+SCOPE_POLICY = ManagementScopePolicy(
+    full_management_scope=REQUIRED_SCOPE,
+    diagnostics_read_scope=DIAGNOSTICS_READ_SCOPE,
+    recovery_read_scope=RECOVERY_READ_SCOPE,
+    recovery_execute_scope=RECOVERY_EXECUTE_SCOPE,
+)
 
 
 def make_key():
@@ -101,7 +119,6 @@ def authenticator(provider: OidcProvider) -> OidcJwtManagementAuthenticator:
         config=OidcJwtConfig(
             issuer=ISSUER,
             audience=AUDIENCE,
-            required_scope=REQUIRED_SCOPE,
             allowed_algorithms=("RS256",),
         ),
         http_client=provider.client(),
@@ -187,12 +204,14 @@ async def test_alg_none_is_rejected():
 
 
 @pytest.mark.anyio
-async def test_missing_required_management_scope_is_forbidden():
+async def test_valid_token_without_recognized_scope_authenticates_as_principal():
     key = make_key()
     provider = OidcProvider([{"keys": [public_jwk(key)]}])
 
-    with pytest.raises(InsufficientManagementScopeError):
-        await authenticator(provider).authenticate(credentials_for(token_for(key, scope="other.scope")))
+    principal = await authenticator(provider).authenticate(credentials_for(token_for(key, scope="other.scope")))
+
+    assert principal.authentication_method == "oidc_jwt"
+    assert principal.scopes == frozenset({"other.scope"})
 
 
 @pytest.mark.anyio
@@ -216,7 +235,7 @@ async def test_jti_is_required_as_non_empty_string(jti):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("scope", [["read", REQUIRED_SCOPE], {"scope": REQUIRED_SCOPE}, 123, True])
+@pytest.mark.parametrize("scope", [None, ["read", REQUIRED_SCOPE], {"scope": REQUIRED_SCOPE}, 123, True])
 async def test_scope_must_be_space_delimited_string(scope):
     key = make_key()
     provider = OidcProvider([{"keys": [public_jwk(key)]}])
@@ -330,6 +349,223 @@ def test_oidc_token_without_scope_returns_forbidden():
     response = client.get("/events", headers={"Authorization": f"Bearer {token_for(key, scope='other.scope')}"})
 
     assert response.status_code == 403
+
+
+def test_oidc_insufficient_scope_challenge_names_required_scope_only():
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    client = TestClient(create_app(settings=oidc_settings(), management_identity_http_client=provider.client()))
+
+    response = client.get("/events", headers={"Authorization": f"Bearer {token_for(key, scope=RECOVERY_READ_SCOPE)}"})
+
+    assert response.status_code == 403
+    challenge = response.headers["WWW-Authenticate"]
+    assert 'Bearer error="insufficient_scope"' in challenge
+    assert f'scope="{DIAGNOSTICS_READ_SCOPE}"' in challenge
+    assert RECOVERY_READ_SCOPE not in challenge
+
+
+@pytest.mark.parametrize(
+    ("scope", "events_status", "recovery_status", "redelivery_status"),
+    [
+        (DIAGNOSTICS_READ_SCOPE, 200, 403, 403),
+        (RECOVERY_READ_SCOPE, 403, 200, 403),
+        (RECOVERY_EXECUTE_SCOPE, 403, 403, 404),
+        (f"{DIAGNOSTICS_READ_SCOPE} {RECOVERY_READ_SCOPE} {RECOVERY_EXECUTE_SCOPE}", 200, 200, 404),
+        (REQUIRED_SCOPE, 200, 200, 404),
+    ],
+)
+def test_oidc_route_authorization_scope_matrix(scope, events_status, recovery_status, redelivery_status):
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    client = TestClient(create_app(settings=oidc_settings(), management_identity_http_client=provider.client()))
+    headers = {"Authorization": f"Bearer {token_for(key, scope=scope)}"}
+
+    assert client.get("/events", headers=headers).status_code == events_status
+    assert client.get("/api/v1/recovery-actions", headers=headers).status_code == recovery_status
+    assert client.post(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001/github-deliveries/1/redelivery",
+        headers=headers,
+    ).status_code == redelivery_status
+
+
+def test_oidc_capabilities_are_independent_and_exactly_matched():
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    client = TestClient(create_app(settings=oidc_settings(), management_identity_http_client=provider.client()))
+    headers = {"Authorization": f"Bearer {token_for(key, scope='webhook-monitor.recovery.execute-extra')}"}
+
+    assert client.post(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001/github-deliveries/1/redelivery",
+        headers=headers,
+    ).status_code == 403
+
+
+def test_authorizer_prefers_exact_scope_over_full_management_scope():
+    principal = ManagementPrincipal(
+        authentication_method="oidc_jwt",
+        issuer=ISSUER,
+        subject="principal-001",
+        client_id="client-001",
+        scopes=frozenset({REQUIRED_SCOPE, RECOVERY_EXECUTE_SCOPE}),
+    )
+
+    authorization = authorize_management_capability(
+        principal=principal,
+        capability=MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE,
+        scope_policy=SCOPE_POLICY,
+    )
+
+    assert authorization.capability == MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE
+    assert authorization.authorization_method == "oidc_scope"
+    assert authorization.matched_scope == RECOVERY_EXECUTE_SCOPE
+
+
+def test_authorizer_uses_full_management_scope_as_compatibility_umbrella():
+    principal = ManagementPrincipal(
+        authentication_method="oidc_jwt",
+        issuer=ISSUER,
+        subject="principal-001",
+        client_id="client-001",
+        scopes=frozenset({REQUIRED_SCOPE}),
+    )
+
+    authorization = authorize_management_capability(
+        principal=principal,
+        capability=MANAGEMENT_CAPABILITY_RECOVERY_READ,
+        scope_policy=SCOPE_POLICY,
+    )
+
+    assert authorization.matched_scope == REQUIRED_SCOPE
+
+
+def test_authorizer_rejects_unknown_scopes_for_application_capability():
+    principal = ManagementPrincipal(
+        authentication_method="oidc_jwt",
+        issuer=ISSUER,
+        subject="principal-001",
+        client_id="client-001",
+        scopes=frozenset({"unknown.scope"}),
+    )
+
+    with pytest.raises(InsufficientManagementScopeError):
+        authorize_management_capability(
+            principal=principal,
+            capability=MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ,
+            scope_policy=SCOPE_POLICY,
+        )
+
+
+class FailingListRecentDeliveryStore(InMemoryDeliveryStore):
+    def list_recent(self):
+        raise AssertionError("delivery store should not be accessed")
+
+
+class FailingDeliveryLookupStore(InMemoryDeliveryStore):
+    def get_attempt(self, attempt_id):
+        raise AssertionError("delivery store should not be accessed")
+
+
+class FailingRecoveryActionStore(InMemoryRecoveryActionStore):
+    def list_recent(self, *, limit, after=None):
+        raise AssertionError("recovery action store should not be accessed")
+
+
+class RecordingGitHubDeliveryClient:
+    def __init__(self):
+        self.calls = []
+
+    async def list_repository_webhook_deliveries(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AssertionError("GitHub read client should not be accessed")
+
+    async def aclose(self):
+        pass
+
+
+class RecordingGitHubRedeliveryClient:
+    def __init__(self):
+        self.calls = []
+
+    async def request_repository_webhook_redelivery(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AssertionError("GitHub write client should not be accessed")
+
+    async def aclose(self):
+        pass
+
+
+def test_insufficient_diagnostics_scope_blocks_delivery_store_access():
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    client = TestClient(
+        create_app(
+            settings=oidc_settings(),
+            delivery_store=FailingListRecentDeliveryStore(max_events=50),
+            management_identity_http_client=provider.client(),
+        )
+    )
+
+    response = client.get("/events", headers={"Authorization": f"Bearer {token_for(key, scope=RECOVERY_READ_SCOPE)}"})
+
+    assert response.status_code == 403
+
+
+def test_insufficient_recovery_read_scope_blocks_recovery_store_access():
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    client = TestClient(
+        create_app(
+            settings=oidc_settings(),
+            recovery_action_store=FailingRecoveryActionStore(max_actions=50),
+            management_identity_http_client=provider.client(),
+        )
+    )
+
+    response = client.get(
+        "/api/v1/recovery-actions",
+        headers={"Authorization": f"Bearer {token_for(key, scope=DIAGNOSTICS_READ_SCOPE)}"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_insufficient_redelivery_scope_blocks_all_business_side_effects():
+    key = make_key()
+    provider = OidcProvider([{"keys": [public_jwk(key)]}])
+    github_delivery_client = RecordingGitHubDeliveryClient()
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_auth_mode="oidc_jwt",
+        management_oidc_issuer=ISSUER,
+        management_oidc_audience=AUDIENCE,
+        github_reconciliation_enabled=True,
+        github_repository_webhook_token="synthetic-github-token",
+        github_redelivery_enabled=True,
+        github_repository_webhook_write_token="synthetic-github-write-token",
+        _env_file=None,
+    )
+    client = TestClient(
+        create_app(
+            settings=settings,
+            delivery_store=FailingDeliveryLookupStore(max_events=50),
+            recovery_action_store=FailingRecoveryActionStore(max_actions=50),
+            github_delivery_client=github_delivery_client,
+            github_redelivery_client=github_redelivery_client,
+            management_identity_http_client=provider.client(),
+        )
+    )
+
+    response = client.post(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001/github-deliveries/1/redelivery",
+        headers={"Authorization": f"Bearer {token_for(key, scope=RECOVERY_READ_SCOPE)}"},
+    )
+
+    assert response.status_code == 403
+    assert github_delivery_client.calls == []
+    assert github_redelivery_client.calls == []
 
 
 def test_disabled_management_api_does_not_contact_oidc_provider():

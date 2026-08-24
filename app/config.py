@@ -35,7 +35,11 @@ class Settings(BaseSettings):
     management_api_token: SecretStr | None = None
     management_oidc_issuer: str | None = None
     management_oidc_audience: str | None = None
-    management_oidc_required_scope: str = "webhook-monitor.manage"
+    management_oidc_required_scope: str | None = None
+    management_oidc_full_management_scope: str = "webhook-monitor.manage"
+    management_oidc_diagnostics_read_scope: str = "webhook-monitor.diagnostics.read"
+    management_oidc_recovery_read_scope: str = "webhook-monitor.recovery.read"
+    management_oidc_recovery_execute_scope: str = "webhook-monitor.recovery.execute"
     management_oidc_allowed_algorithms: str = "RS256"
     management_oidc_http_timeout_seconds: PositiveInt = 5
     github_reconciliation_enabled: bool = False
@@ -70,8 +74,26 @@ class Settings(BaseSettings):
             validate_oidc_issuer(self.management_oidc_issuer)
             if not self.management_oidc_audience.strip():
                 raise ValueError("MANAGEMENT_OIDC_AUDIENCE must not be blank")
-            if not self.management_oidc_required_scope.strip():
-                raise ValueError("MANAGEMENT_OIDC_REQUIRED_SCOPE must not be blank")
+            full_management_scope = self.management_oidc_full_management_scope
+            if self.management_oidc_required_scope is not None:
+                deprecated_required_scope = self.management_oidc_required_scope
+                if not deprecated_required_scope.strip():
+                    raise ValueError("MANAGEMENT_OIDC_REQUIRED_SCOPE must not be blank")
+                if (
+                    full_management_scope != "webhook-monitor.manage"
+                    and deprecated_required_scope != full_management_scope
+                ):
+                    raise ValueError(
+                        "MANAGEMENT_OIDC_REQUIRED_SCOPE must match MANAGEMENT_OIDC_FULL_MANAGEMENT_SCOPE when both are set"
+                    )
+                full_management_scope = deprecated_required_scope
+                object.__setattr__(self, "management_oidc_full_management_scope", full_management_scope)
+            validate_management_scope_mapping(
+                full_management_scope=full_management_scope,
+                diagnostics_read_scope=self.management_oidc_diagnostics_read_scope,
+                recovery_read_scope=self.management_oidc_recovery_read_scope,
+                recovery_execute_scope=self.management_oidc_recovery_execute_scope,
+            )
             parse_allowed_jwt_algorithms(self.management_oidc_allowed_algorithms)
         if self.github_reconciliation_enabled:
             if not self.management_api_enabled:
@@ -101,3 +123,29 @@ def validate_oidc_issuer(value: str) -> None:
         or parsed.fragment
     ):
         raise ValueError("MANAGEMENT_OIDC_ISSUER must be an HTTPS issuer URI without query or fragment")
+
+
+def validate_management_scope_mapping(
+    *,
+    full_management_scope: str,
+    diagnostics_read_scope: str,
+    recovery_read_scope: str,
+    recovery_execute_scope: str,
+) -> None:
+    named_scopes = {
+        "MANAGEMENT_OIDC_FULL_MANAGEMENT_SCOPE": full_management_scope,
+        "MANAGEMENT_OIDC_DIAGNOSTICS_READ_SCOPE": diagnostics_read_scope,
+        "MANAGEMENT_OIDC_RECOVERY_READ_SCOPE": recovery_read_scope,
+        "MANAGEMENT_OIDC_RECOVERY_EXECUTE_SCOPE": recovery_execute_scope,
+    }
+    normalized_scopes = {}
+    for name, value in named_scopes.items():
+        if not value.strip():
+            raise ValueError(f"{name} must not be blank")
+        normalized_scopes[name] = value.strip()
+        if normalized_scopes[name] != value:
+            raise ValueError(f"{name} must not contain surrounding whitespace")
+
+    values = list(normalized_scopes.values())
+    if len(set(values)) != len(values):
+        raise ValueError("Management OIDC capability scopes must be distinct")

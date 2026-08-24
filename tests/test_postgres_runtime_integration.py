@@ -34,6 +34,8 @@ GITHUB_WRITE_TOKEN = "synthetic-github-write-token"
 OIDC_ISSUER = "https://identity.example.com/"
 OIDC_AUDIENCE = "https://github-webhook-monitor.example/"
 OIDC_SCOPE = "webhook-monitor.manage"
+OIDC_RECOVERY_READ_SCOPE = "webhook-monitor.recovery.read"
+OIDC_RECOVERY_EXECUTE_SCOPE = "webhook-monitor.recovery.execute"
 
 
 class RecordingGitHubDeliveryClient:
@@ -87,7 +89,13 @@ def public_jwk(key, *, kid: str = "key-1") -> dict[str, object]:
     return payload
 
 
-def oidc_token(key, *, subject: str = "principal-001", client_id: str = "client-001") -> str:
+def oidc_token(
+    key,
+    *,
+    subject: str = "principal-001",
+    client_id: str = "client-001",
+    scope: str = OIDC_SCOPE,
+) -> str:
     return jwt.encode(
         {
             "iss": OIDC_ISSUER,
@@ -97,7 +105,7 @@ def oidc_token(key, *, subject: str = "principal-001", client_id: str = "client-
             "sub": subject,
             "client_id": client_id,
             "jti": "jwt-id-001",
-            "scope": OIDC_SCOPE,
+            "scope": scope,
         },
         key,
         algorithm="RS256",
@@ -294,7 +302,7 @@ def test_postgresql_runtime_startup_requires_migrated_schema(
     command.upgrade(alembic_config, "head")
 
 
-def test_postgresql_stage13_migration_lifecycle_preserves_stage12_journal_history(
+def test_postgresql_stage14_migration_lifecycle_preserves_stage12_and_stage13_journal_history(
     database_url: str,
     alembic_config: Config,
 ):
@@ -353,7 +361,13 @@ def test_postgresql_stage13_migration_lifecycle_preserves_stage12_journal_histor
         command.upgrade(alembic_config, "head")
         inspector = inspect(engine)
         recovery_columns = {column["name"] for column in inspector.get_columns("recovery_actions")}
-        assert {"principal_issuer", "principal_subject", "principal_client_id"} <= recovery_columns
+        assert {
+            "principal_issuer",
+            "principal_subject",
+            "principal_client_id",
+            "authorization_capability",
+            "authorization_scope",
+        } <= recovery_columns
         recovery_indexes = {index["name"] for index in inspector.get_indexes("recovery_actions")}
         assert "ix_recovery_actions_recent" in recovery_indexes
         with TestClient(create_app(settings=runtime_settings(database_url))) as client:
@@ -368,14 +382,21 @@ def test_postgresql_stage13_migration_lifecycle_preserves_stage12_journal_histor
         assert historical["principal_issuer"] is None
         assert historical["principal_subject"] is None
         assert historical["principal_client_id"] is None
+        assert historical["authorization_capability"] is None
+        assert historical["authorization_scope"] is None
 
-        command.downgrade(alembic_config, "20260824_0003")
+        command.downgrade(alembic_config, "20260824_0004")
         inspector = inspect(engine)
         assert "recovery_actions" in inspector.get_table_names()
         recovery_columns = {column["name"] for column in inspector.get_columns("recovery_actions")}
-        assert "principal_issuer" not in recovery_columns
+        assert {"principal_issuer", "principal_subject", "principal_client_id"} <= recovery_columns
+        assert "authorization_capability" not in recovery_columns
+        assert "authorization_scope" not in recovery_columns
         assert "delivery_attempts" in inspector.get_table_names()
         assert "github_deliveries" in inspector.get_table_names()
+        with pytest.raises(DeliveryStoreReadinessError):
+            with TestClient(create_app(settings=runtime_settings(database_url))):
+                pass
 
         command.upgrade(alembic_config, "head")
     finally:
@@ -661,6 +682,8 @@ def test_postgresql_runtime_accepts_verified_github_redelivery_without_fabricati
     assert action["principal_issuer"] is None
     assert action["principal_subject"] is None
     assert action["principal_client_id"] is None
+    assert action["authorization_capability"] == "recovery.execute"
+    assert action["authorization_scope"] is None
     assert action["completed_at"] is not None
 
 
@@ -719,7 +742,7 @@ def test_postgresql_runtime_persists_oidc_principal_attribution_across_restart(
         attempt_id = webhook_response.json()["event"]["attempt_id"]
         redelivery_response = first_client.post(
             f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
-            headers={"Authorization": f"Bearer {oidc_token(key)}"},
+            headers={"Authorization": f"Bearer {oidc_token(key, scope=OIDC_RECOVERY_EXECUTE_SCOPE)}"},
         )
         action_id = redelivery_response.json()["action_id"]
 
@@ -734,6 +757,8 @@ def test_postgresql_runtime_persists_oidc_principal_attribution_across_restart(
     assert action["principal_issuer"] == OIDC_ISSUER
     assert action["principal_subject"] == "principal-001"
     assert action["principal_client_id"] == "client-001"
+    assert action["authorization_capability"] == "recovery.execute"
+    assert action["authorization_scope"] == OIDC_RECOVERY_EXECUTE_SCOPE
 
     query_key = make_oidc_key()
     with TestClient(
@@ -744,7 +769,9 @@ def test_postgresql_runtime_persists_oidc_principal_attribution_across_restart(
     ) as second_client:
         action_response = second_client.get(
             f"/api/v1/recovery-actions/{action_id}",
-            headers={"Authorization": f"Bearer {oidc_token(query_key, subject='principal-reader')}"},
+            headers={
+                "Authorization": f"Bearer {oidc_token(query_key, subject='principal-reader', scope=OIDC_RECOVERY_READ_SCOPE)}"
+            },
         )
 
     assert action_response.status_code == 200
@@ -753,6 +780,45 @@ def test_postgresql_runtime_persists_oidc_principal_attribution_across_restart(
     assert body["principal_issuer"] == OIDC_ISSUER
     assert body["principal_subject"] == "principal-001"
     assert body["principal_client_id"] == "client-001"
+    assert body["authorization_capability"] == "recovery.execute"
+    assert body["authorization_scope"] == OIDC_RECOVERY_EXECUTE_SCOPE
+
+
+def test_postgresql_runtime_records_oidc_umbrella_scope_authorization_evidence(
+    database_url: str,
+    engine,
+):
+    key = make_oidc_key()
+    github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    payload = encode_json({"repository": {"full_name": "octo/example"}})
+
+    with TestClient(
+        create_app(
+            settings=oidc_redelivery_runtime_settings(database_url),
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
+            management_identity_http_client=oidc_http_client(key),
+        )
+    ) as client:
+        webhook_response = post_webhook(client, payload)
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        response = client.post(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+            headers={"Authorization": f"Bearer {oidc_token(key, scope=OIDC_SCOPE)}"},
+        )
+
+    assert response.status_code == 202
+    assert github_redelivery_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 100}
+    ]
+    with engine.connect() as connection:
+        action = connection.execute(select(recovery_actions)).mappings().one()
+    assert action["authentication_method"] == "oidc_jwt"
+    assert action["authorization_capability"] == "recovery.execute"
+    assert action["authorization_scope"] == OIDC_SCOPE
 
 
 def test_postgresql_runtime_records_failed_redelivery_action_without_raw_body(

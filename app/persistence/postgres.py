@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
-from app.domain.management import ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
+from app.domain.management import ManagementAuthorization, ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
 from app.domain.recovery_actions import (
     RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
     RECOVERY_ACTION_STATE_INITIATED,
@@ -224,6 +224,8 @@ def row_to_recovery_action(row: Mapping[str, Any]) -> RecoveryAction:
         principal_issuer=row["principal_issuer"],
         principal_subject=row["principal_subject"],
         principal_client_id=row["principal_client_id"],
+        authorization_capability=row["authorization_capability"],
+        authorization_scope=row["authorization_scope"],
         state=row["state"],
         upstream_status_code=row["upstream_status_code"],
         failure_category=row["failure_category"],
@@ -242,6 +244,7 @@ class PostgresRecoveryActionStore(RecoveryActionStore):
         github_delivery_id: int,
         requested_at: datetime,
         principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
+        authorization: ManagementAuthorization | None = None,
     ) -> RecoveryAction:
         action_id = uuid4()
         values = {
@@ -258,6 +261,8 @@ class PostgresRecoveryActionStore(RecoveryActionStore):
             "principal_issuer": principal.issuer,
             "principal_subject": principal.subject,
             "principal_client_id": principal.client_id,
+            "authorization_capability": authorization.capability if authorization is not None else None,
+            "authorization_scope": authorization.matched_scope if authorization is not None else None,
             "state": RECOVERY_ACTION_STATE_INITIATED,
             "upstream_status_code": None,
             "failure_category": None,

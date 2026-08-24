@@ -167,9 +167,69 @@ def test_oidc_management_mode_accepts_required_settings_without_shared_token():
 
     assert settings.management_auth_mode == "oidc_jwt"
     assert settings.management_api_token is None
-    assert settings.management_oidc_required_scope == "webhook-monitor.manage"
+    assert settings.management_oidc_full_management_scope == "webhook-monitor.manage"
+    assert settings.management_oidc_diagnostics_read_scope == "webhook-monitor.diagnostics.read"
+    assert settings.management_oidc_recovery_read_scope == "webhook-monitor.recovery.read"
+    assert settings.management_oidc_recovery_execute_scope == "webhook-monitor.recovery.execute"
     assert settings.management_oidc_allowed_algorithms == "RS256"
     assert settings.management_oidc_http_timeout_seconds == 5
+
+
+def test_deprecated_oidc_required_scope_aliases_full_management_scope():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_auth_mode="oidc_jwt",
+        management_oidc_issuer="https://identity.example.com/",
+        management_oidc_audience="https://github-webhook-monitor.example/",
+        management_oidc_required_scope="synthetic.full.manage",
+        _env_file=None,
+    )
+
+    assert settings.management_oidc_full_management_scope == "synthetic.full.manage"
+
+
+@pytest.mark.parametrize(
+    "scope_values",
+    [
+        {"management_oidc_full_management_scope": "   "},
+        {"management_oidc_diagnostics_read_scope": ""},
+        {"management_oidc_recovery_read_scope": " webhook-monitor.recovery.read "},
+        {
+            "management_oidc_full_management_scope": "webhook-monitor.recovery.execute",
+            "management_oidc_recovery_execute_scope": "webhook-monitor.recovery.execute",
+        },
+        {
+            "management_oidc_diagnostics_read_scope": "same.scope",
+            "management_oidc_recovery_read_scope": "same.scope",
+        },
+    ],
+)
+def test_oidc_capability_scope_mapping_rejects_blank_whitespace_or_duplicates(scope_values):
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_auth_mode="oidc_jwt",
+            management_oidc_issuer="https://identity.example.com/",
+            management_oidc_audience="https://github-webhook-monitor.example/",
+            _env_file=None,
+            **scope_values,
+        )
+
+
+def test_oidc_required_scope_alias_must_match_custom_full_management_scope():
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_auth_mode="oidc_jwt",
+            management_oidc_issuer="https://identity.example.com/",
+            management_oidc_audience="https://github-webhook-monitor.example/",
+            management_oidc_required_scope="old.manage",
+            management_oidc_full_management_scope="new.manage",
+            _env_file=None,
+        )
 
 
 @pytest.mark.parametrize(

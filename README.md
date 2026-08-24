@@ -236,19 +236,37 @@ If you are testing locally, you can expose your development server with a tunnel
 
 Management endpoints use Bearer authentication. The configured `MANAGEMENT_AUTH_MODE` selects exactly one authoritative credential mode.
 
-`shared_token` is the default and preserves the original shared management credential contract. It requires `MANAGEMENT_API_TOKEN` when the management API is enabled. This mode proves that a request has authenticated management access, but it does not identify an individual management principal. Recovery-action records created in this mode use `authentication_method = management_bearer` and leave principal fields empty.
+`shared_token` is the default and preserves the original shared management credential contract. It requires `MANAGEMENT_API_TOKEN` when the management API is enabled. This mode proves that a request has authenticated management access, but it does not identify an individual management principal. It is a full-management compatibility credential and cannot provide least-privilege per-principal authorization. Recovery-action records created in this mode use `authentication_method = management_bearer` and leave principal fields empty.
 
 `oidc_jwt` configures the service as an OAuth resource server for externally issued JWT access tokens compatible with the RFC 9068 JWT Access Token Profile. The service does not issue tokens, run browser login, use sessions, perform token exchange, or call UserInfo. Token acquisition happens outside this service.
 
-OIDC JWT mode requires a trusted HTTPS issuer, expected audience, required coarse management scope, and explicit asymmetric signing-algorithm allowlist. The service obtains OpenID Provider metadata from the configured issuer, validates that metadata issuer exactly matches configuration, and uses only the validated HTTPS `jwks_uri` for signature keys. Incoming tokens cannot choose key URLs through JWT headers or claims.
+OIDC JWT mode requires a trusted HTTPS issuer, expected audience, RFC-style `scope` claim, and explicit asymmetric signing-algorithm allowlist. The service obtains OpenID Provider metadata from the configured issuer, validates that metadata issuer exactly matches configuration, and uses only the validated HTTPS `jwks_uri` for signature keys. Incoming tokens cannot choose key URLs through JWT headers or claims.
 
-Strict access-token validation requires `typ = at+jwt` or `typ = application/at+jwt`, an allowlisted asymmetric algorithm such as `RS256`, a valid signature, exact issuer match, expected audience, unexpired `exp`, valid `iat`, valid `nbf` when present, non-empty `sub`, non-empty `client_id`, non-empty `jti`, and the configured management scope such as `webhook-monitor.manage`. A signed OIDC ID-token-style JWT is not accepted as a management access token.
+Strict access-token validation requires `typ = at+jwt` or `typ = application/at+jwt`, an allowlisted asymmetric algorithm such as `RS256`, a valid signature, exact issuer match, expected audience, unexpired `exp`, valid `iat`, valid `nbf` when present, non-empty `sub`, non-empty `client_id`, non-empty `jti`, and a space-delimited `scope` string. A signed OIDC ID-token-style JWT is not accepted as a management access token.
 
-When OIDC JWT mode authenticates a request, the management principal is represented by the stable pair `issuer + subject`. The `client_id` is supplementary OAuth client attribution, not the principal identity. The principal may represent an individual, workload, client, or another authorization-server principal type. Stage 13 does not implement role mapping, fine-grained route permissions, or RBAC; it checks one coarse management scope only.
+When OIDC JWT mode authenticates a request, the management principal is represented by the stable pair `issuer + subject`. The `client_id` is supplementary OAuth client attribution, not the principal identity. The principal may represent an individual, workload, client, or another authorization-server principal type. The service does not implement role mapping, group mapping, local users, or RBAC.
 
 The service validates `jti` because the selected access-token profile requires it, but does not persist it, log it, use it for replay detection, or turn it into idempotency. The service does not persist raw access tokens, full JWT claims, email, name, username, profile data, groups, or refresh tokens. Future recovery-action records created through OIDC JWT mode snapshot only the authentication method plus principal issuer, subject, and client ID.
 
 Identity-provider availability is isolated to management requests that need OIDC authentication. The service does not contact the provider during import, application startup, `/health`, `/ready`, or `POST /webhook/github`.
+
+## Management authorization
+
+Authentication establishes a `ManagementPrincipal`. Authorization then checks the route's required `ManagementCapability` against that principal and returns a small authorization context. OIDC authorization uses verified OAuth scopes only; it does not use `issuer`, `subject`, `client_id`, email, profile data, groups, or local database policy as authorization inputs.
+
+Current capabilities and exact OIDC scopes:
+
+| Management surface | Required capability | Exact OIDC scope |
+| --- | --- | --- |
+| Diagnostics: `GET /events`, `GET /api/v1/delivery-attempts`, `GET /api/v1/delivery-attempts/{attempt_id}`, `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries` | `diagnostics.read` | `webhook-monitor.diagnostics.read` |
+| Recovery journal: `GET /api/v1/recovery-actions`, `GET /api/v1/recovery-actions/{action_id}` | `recovery.read` | `webhook-monitor.recovery.read` |
+| Controlled redelivery: `POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery` | `recovery.execute` | `webhook-monitor.recovery.execute` |
+
+Capabilities are independent and exact-match only. `webhook-monitor.recovery.execute` does not imply `webhook-monitor.recovery.read`, and suffixes such as `webhook-monitor.recovery.execute-extra` do not match. Unknown scopes are ignored for application authorization.
+
+The compatibility scope `webhook-monitor.manage` grants all current management capabilities for existing Stage 13 deployments. It is a full-management umbrella, not a least-privilege scope. Prefer the fine-grained OIDC scopes when capability separation matters.
+
+An invalid, expired, malformed, or unverifiable bearer token returns `401 Unauthorized`. An authenticated OIDC principal missing the route's required scope returns `403 Forbidden` with an insufficient-scope Bearer challenge naming the required scope. If the identity provider is unavailable and token validity cannot be evaluated, the management request returns `503 Service Unavailable`.
 
 ## Delivery ledger model
 
@@ -451,7 +469,9 @@ The recovery action journal records privileged control-plane intent and outcome 
 
 For controlled repository-webhook redelivery, the application validates the local attempt, repository target, and exact upstream `github_delivery_id` first. It then writes an initiated recovery action before the GitHub mutation POST. If that journal write fails, the GitHub mutation is not sent. After the single POST attempt, the action is finalized as `accepted`, `failed`, or `outcome_unknown`.
 
-Journal entries expose an application-owned `action_id`, action type `github_repository_webhook_redelivery`, timestamps, target snapshot fields, authentication method, optional principal snapshot fields, state, optional upstream status code, and a bounded failure category. They do not expose database surrogate IDs, tokens, webhook secrets, raw webhook bodies, authorization headers, raw GitHub error responses, raw JWTs, full JWT claims, or GitHub stored webhook payloads.
+Journal entries expose an application-owned `action_id`, action type `github_repository_webhook_redelivery`, timestamps, target snapshot fields, authentication method, optional principal snapshot fields, optional authorization evidence, state, optional upstream status code, and a bounded failure category. They do not expose database surrogate IDs, tokens, webhook secrets, raw webhook bodies, authorization headers, raw GitHub error responses, raw JWTs, full JWT claims, full token scope sets, or GitHub stored webhook payloads.
+
+For new controlled redelivery actions, authorization evidence records `authorization_capability = recovery.execute`. OIDC actions also record the exact external scope that authorized the mutation: `webhook-monitor.recovery.execute` when the fine-grained scope matched, or `webhook-monitor.manage` when the compatibility umbrella authorized it. Shared-token actions record null `authorization_scope`; historical actions keep both authorization fields null because the precise authorization basis was not recorded at the time.
 
 Terminal states are intentionally conservative:
 
@@ -465,7 +485,7 @@ Each authenticated management POST is a distinct action with a distinct `action_
 
 PostgreSQL runtime persists recovery-action history across application restarts. Memory runtime keeps a non-durable in-process journal for local runtime behavior and tests; it does not survive restart. Production-grade durable action history requires PostgreSQL runtime.
 
-Shared management bearer authentication does not provide per-principal identity. OIDC JWT mode records the verified issuer and subject for future recovery actions, but this is a management principal identity rather than a guaranteed human identity. Fine-grained authorization remains deferred.
+Shared management bearer authentication does not provide per-principal identity. OIDC JWT mode records the verified issuer and subject for future recovery actions, but this is a management principal identity rather than a guaranteed human identity.
 
 Read-only journal endpoints are management-authenticated:
 
