@@ -23,3 +23,28 @@ class DeliveryAttemptResponse(BaseModel):
 class DeliveryAttemptsListResponse(BaseModel):
     items: list[DeliveryAttemptResponse]
     next_cursor: str | None
+
+
+class GitHubDeliverySummaryResponse(BaseModel):
+    github_delivery_id: int
+    delivery_guid: str
+    delivered_at: datetime
+    redelivery: bool
+    duration: float | None
+    status: str | None
+    status_code: int | None
+    event: str | None
+    action: str | None
+    installation_id: int | None
+    repository_id: int | None
+    throttled_at: datetime | None
+
+
+class GitHubDeliveriesReconciliationResponse(BaseModel):
+    attempt_id: UUID
+    delivery_guid: str
+    hook_id: int
+    repository: str
+    matches: list[GitHubDeliverySummaryResponse]
+    search_complete: bool
+    next_cursor: str | None

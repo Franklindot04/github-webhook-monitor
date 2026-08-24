@@ -19,6 +19,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     webhook_secret: SecretStr = Field(min_length=1)
@@ -29,6 +30,10 @@ class Settings(BaseSettings):
     database_connect_timeout_seconds: PositiveInt = 5
     management_api_enabled: bool = False
     management_api_token: SecretStr | None = None
+    github_reconciliation_enabled: bool = False
+    github_repository_webhook_token: SecretStr | None = None
+    github_api_timeout_seconds: PositiveInt = 5
+    github_reconciliation_max_pages: int = Field(default=5, ge=1, le=20)
 
     @model_validator(mode="after")
     def validate_runtime_configuration(self) -> "Settings":
@@ -46,5 +51,12 @@ class Settings(BaseSettings):
             if len(management_token) < MIN_MANAGEMENT_API_TOKEN_LENGTH:
                 raise ValueError(
                     f"MANAGEMENT_API_TOKEN must be at least {MIN_MANAGEMENT_API_TOKEN_LENGTH} characters"
+                )
+        if self.github_reconciliation_enabled:
+            if not self.management_api_enabled:
+                raise ValueError("MANAGEMENT_API_ENABLED=true is required when GITHUB_RECONCILIATION_ENABLED=true")
+            if self.github_repository_webhook_token is None:
+                raise ValueError(
+                    "GITHUB_REPOSITORY_WEBHOOK_TOKEN is required when GITHUB_RECONCILIATION_ENABLED=true"
                 )
         return self

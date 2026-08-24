@@ -117,6 +117,7 @@ Once the server is running, you can open:
 | GET | `/ready` | Runtime dependency readiness endpoint |
 | GET | `/api/v1/delivery-attempts` | Preferred management diagnostics endpoint for paginated delivery attempts |
 | GET | `/api/v1/delivery-attempts/{attempt_id}` | Preferred management diagnostics endpoint for one delivery attempt |
+| GET | `/api/v1/delivery-attempts/{attempt_id}/github-deliveries` | Management endpoint for read-only GitHub repository-webhook delivery reconciliation |
 | GET | `/events` | Deprecated compatibility endpoint for recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
@@ -135,6 +136,7 @@ Management plane:
 
 - `GET /api/v1/delivery-attempts`
 - `GET /api/v1/delivery-attempts/{attempt_id}`
+- `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries`
 - `GET /events`
 
 ## Local webhook test
@@ -298,6 +300,7 @@ Use the versioned management diagnostics API for read-only delivery-attempt insp
 
 - `GET /api/v1/delivery-attempts`
 - `GET /api/v1/delivery-attempts/{attempt_id}`
+- `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries`
 
 The list endpoint returns recent observed receipt attempts in deterministic recent-first order. Responses include the application-owned `attempt_id`, GitHub logical delivery identity fields `delivery_guid` and `hook_id`, `received_at`, `payload_sha256`, event metadata, repository, sender, and installation target metadata. Responses do not include raw webhook bodies, HMAC signatures, authorization headers, database surrogate IDs, or database connection details.
 
@@ -340,6 +343,53 @@ Backend behavior differs only by retention boundary:
 - PostgreSQL mode traverses durable delivery-attempt history; page limits do not delete rows and `MAX_EVENTS` is not a PostgreSQL retention policy.
 
 `GET /events` remains supported as a compatibility endpoint under the same management authentication contract, but it is deprecated in favor of the v1 diagnostics API. No removal date is set.
+
+## GitHub reconciliation
+
+GitHub upstream reconciliation is disabled by default and is available only as a management-plane capability. It supports GitHub repository webhook delivery history only:
+
+```env
+MANAGEMENT_API_ENABLED=true
+MANAGEMENT_API_TOKEN=replace-with-a-high-entropy-management-token-000001
+GITHUB_RECONCILIATION_ENABLED=true
+GITHUB_API_TIMEOUT_SECONDS=5
+GITHUB_RECONCILIATION_MAX_PAGES=5
+```
+
+When reconciliation is enabled, configure a repository-scoped token separately:
+
+```env
+GITHUB_REPOSITORY_WEBHOOK_TOKEN=replace-with-a-read-only-repository-webhook-token
+```
+
+The token requires repository **Webhooks: read** permission. Stage 10 does not require **Webhooks: write** permission and does not execute redelivery.
+
+Reconciliation uses GitHub REST API version `2026-03-10` and the repository webhook list-deliveries endpoint:
+
+```text
+GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries
+```
+
+The management endpoint is:
+
+```text
+GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries
+```
+
+The endpoint starts from a local `attempt_id`, verifies that the stored attempt can be safely attributed to a repository webhook, and searches bounded GitHub delivery history for records whose GitHub `guid` exactly matches the local `delivery_guid`. Results keep local and upstream identities separate:
+
+- `attempt_id` is this service's local receiver-observation UUID.
+- `delivery_guid` is the GitHub `X-GitHub-Delivery` header value retained locally.
+- `hook_id` is the GitHub `X-GitHub-Hook-ID` value retained locally.
+- `github_delivery_id` is GitHub's upstream numeric delivery-history record ID.
+
+GitHub may return multiple upstream records for one `delivery_guid`; the response preserves all matches. The upstream `redelivery` field is GitHub-reported delivery-history metadata for that upstream record. It is not copied into the local delivery attempt and does not classify the local receiver attempt as a replay, duplicate, or redelivery.
+
+The search uses GitHub cursor pagination with `per_page=100` and is bounded by `GITHUB_RECONCILIATION_MAX_PAGES`. If more GitHub history remains after the configured bound, the response sets `search_complete` to `false` and returns an opaque `next_cursor` bound to the same `attempt_id`. Clients must not parse or construct reconciliation cursors. The cursor is pagination state, not an authorization credential, and it is not cryptographically signed.
+
+GitHub reconciliation is read-only. It does not call GitHub's delivery-detail endpoint, does not retrieve raw upstream payloads or request headers, does not persist upstream delivery records, and does not affect webhook ingestion.
+
+GitHub availability is not part of application readiness. The app does not call GitHub during startup, `GET /health` remains liveness-only, `GET /ready` remains scoped to runtime persistence readiness, and valid webhook ingestion continues even if GitHub is unavailable.
 
 ## Repository files
 

@@ -8,6 +8,7 @@ license = "MIT"
 dependencies = [
     "alembic>=1.16,<2.0",
     "fastapi>=0.141,<1.0",
+    "httpx2>=2.12,<3.0",
     "psycopg[binary]>=3.2,<4.0",
     "pydantic-settings>=2.12,<3.0",
     "sqlalchemy>=2.0,<3.0",
@@ -16,7 +17,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.12,<3.0",
     "pytest>=9.1,<10.0",
 ]
 

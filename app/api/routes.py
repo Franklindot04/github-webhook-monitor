@@ -7,6 +7,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.v1.delivery_attempts import create_delivery_attempts_router
 from app.security import require_management_access
 from app.services.delivery_queries import DeliveryQueryService
+from app.services.github_reconciliation import GitHubReconciliationService
 from app.services.webhooks import (
     InvalidWebhookSignatureError,
     MalformedWebhookPayloadError,
@@ -92,6 +93,7 @@ def create_router(
     max_webhook_body_bytes: int,
     management_api_enabled: bool,
     management_api_token: str | None,
+    github_reconciliation_service: GitHubReconciliationService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -120,6 +122,7 @@ def create_router(
         create_delivery_attempts_router(
             query_service=DeliveryQueryService(delivery_store),
             management_access_dependency=require_configured_management_access,
+            reconciliation_service=github_reconciliation_service,
         )
     )
 
