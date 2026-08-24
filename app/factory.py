@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 
+import httpx2
 from fastapi import FastAPI
 from starlette.concurrency import run_in_threadpool
 
@@ -10,6 +11,7 @@ from app.integrations.github.client import (
     GitHubRepositoryWebhookRedeliveryClient,
 )
 from app.runtime import RuntimeResources, build_runtime_resources
+from app.security import OidcJwtConfig, OidcJwtManagementAuthenticator, parse_allowed_jwt_algorithms
 from app.services.delivery_queries import DeliveryQueryService
 from app.services.recovery_actions import RecoveryActionQueryService
 from app.services.github_reconciliation import GitHubReconciliationService
@@ -25,6 +27,7 @@ def create_app(
     recovery_action_store: RecoveryActionStore | None = None,
     github_delivery_client: GitHubRepositoryWebhookDeliveriesClient | None = None,
     github_redelivery_client: GitHubRepositoryWebhookRedeliveryClient | None = None,
+    management_identity_http_client: httpx2.AsyncClient | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings()
     runtime_resources = (
@@ -74,6 +77,26 @@ def create_app(
         github_redelivery_client=app_github_redelivery_client,
         recovery_action_store=app_recovery_action_store,
     )
+    app_management_identity_http_client = management_identity_http_client
+    owns_management_identity_http_client = False
+    app_oidc_authenticator = None
+    if app_settings.management_api_enabled and app_settings.management_auth_mode == "oidc_jwt":
+        if app_settings.management_oidc_issuer is None or app_settings.management_oidc_audience is None:
+            raise ValueError("OIDC management settings are required when MANAGEMENT_AUTH_MODE=oidc_jwt")
+        if app_management_identity_http_client is None:
+            app_management_identity_http_client = httpx2.AsyncClient(
+                timeout=app_settings.management_oidc_http_timeout_seconds,
+            )
+            owns_management_identity_http_client = True
+        app_oidc_authenticator = OidcJwtManagementAuthenticator(
+            config=OidcJwtConfig(
+                issuer=app_settings.management_oidc_issuer,
+                audience=app_settings.management_oidc_audience,
+                required_scope=app_settings.management_oidc_required_scope,
+                allowed_algorithms=parse_allowed_jwt_algorithms(app_settings.management_oidc_allowed_algorithms),
+            ),
+            http_client=app_management_identity_http_client,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -85,6 +108,8 @@ def create_app(
                 await app_github_redelivery_client.aclose()
             if owns_github_delivery_client and app_github_delivery_client is not None:
                 await app_github_delivery_client.aclose()
+            if owns_management_identity_http_client and app_management_identity_http_client is not None:
+                await app_management_identity_http_client.aclose()
             if runtime_resources.owns_engine and runtime_resources.engine is not None:
                 await run_in_threadpool(runtime_resources.engine.dispose)
 
@@ -98,6 +123,8 @@ def create_app(
     app.state.github_reconciliation_service = app_github_reconciliation_service
     app.state.github_redelivery_client = app_github_redelivery_client
     app.state.github_redelivery_service = app_github_redelivery_service
+    app.state.management_identity_http_client = app_management_identity_http_client
+    app.state.oidc_management_authenticator = app_oidc_authenticator
     app.include_router(
         create_router(
             app_webhook_service,
@@ -110,6 +137,8 @@ def create_app(
                 if app_settings.management_api_token is not None
                 else None
             ),
+            management_auth_mode=app_settings.management_auth_mode,
+            oidc_management_authenticator=app_oidc_authenticator,
             github_reconciliation_service=app_github_reconciliation_service,
             github_redelivery_service=app_github_redelivery_service,
             recovery_action_query_service=RecoveryActionQueryService(app_recovery_action_store),

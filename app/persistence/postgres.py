@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
+from app.domain.management import ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
 from app.domain.recovery_actions import (
     RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
     RECOVERY_ACTION_STATE_INITIATED,
@@ -220,6 +221,9 @@ def row_to_recovery_action(row: Mapping[str, Any]) -> RecoveryAction:
         repository=row["repository"],
         github_delivery_id=row["github_delivery_id"],
         authentication_method=row["authentication_method"],
+        principal_issuer=row["principal_issuer"],
+        principal_subject=row["principal_subject"],
+        principal_client_id=row["principal_client_id"],
         state=row["state"],
         upstream_status_code=row["upstream_status_code"],
         failure_category=row["failure_category"],
@@ -237,6 +241,7 @@ class PostgresRecoveryActionStore(RecoveryActionStore):
         repository: str,
         github_delivery_id: int,
         requested_at: datetime,
+        principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
     ) -> RecoveryAction:
         action_id = uuid4()
         values = {
@@ -249,7 +254,10 @@ class PostgresRecoveryActionStore(RecoveryActionStore):
             "hook_id": attempt.delivery_identity.hook_id,
             "repository": repository,
             "github_delivery_id": github_delivery_id,
-            "authentication_method": RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
+            "authentication_method": principal.authentication_method,
+            "principal_issuer": principal.issuer,
+            "principal_subject": principal.subject,
+            "principal_client_id": principal.client_id,
             "state": RECOVERY_ACTION_STATE_INITIATED,
             "upstream_status_code": None,
             "failure_category": None,

@@ -5,7 +5,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.delivery_attempts import create_delivery_attempts_router
-from app.security import require_management_access
+from app.domain.management import ManagementPrincipal
+from app.security import (
+    InsufficientManagementScopeError,
+    InvalidManagementTokenError,
+    ManagementIdentityProviderUnavailableError,
+    OidcJwtManagementAuthenticator,
+    authenticate_shared_management_token,
+    management_forbidden,
+    management_identity_unavailable,
+    management_unauthorized,
+)
 from app.services.delivery_queries import DeliveryQueryService
 from app.services.github_reconciliation import GitHubReconciliationService
 from app.services.github_redelivery import GitHubRedeliveryService
@@ -95,6 +105,8 @@ def create_router(
     max_webhook_body_bytes: int,
     management_api_enabled: bool,
     management_api_token: str | None,
+    management_auth_mode: str = "shared_token",
+    oidc_management_authenticator: OidcJwtManagementAuthenticator | None = None,
     github_reconciliation_service: GitHubReconciliationService | None = None,
     github_redelivery_service: GitHubRedeliveryService | None = None,
     recovery_action_query_service: RecoveryActionQueryService | None = None,
@@ -103,12 +115,24 @@ def create_router(
 
     async def require_configured_management_access(
         credentials: HTTPAuthorizationCredentials | None = Depends(management_bearer),
-    ) -> None:
-        require_management_access(
-            management_api_enabled=management_api_enabled,
-            expected_token=management_api_token,
-            credentials=credentials,
-        )
+    ) -> ManagementPrincipal:
+        if not management_api_enabled:
+            raise HTTPException(status_code=404, detail="Not found")
+        if management_auth_mode == "shared_token":
+            return authenticate_shared_management_token(
+                expected_token=management_api_token,
+                credentials=credentials,
+            )
+        if oidc_management_authenticator is None:
+            raise management_identity_unavailable()
+        try:
+            return await oidc_management_authenticator.authenticate(credentials)
+        except InvalidManagementTokenError:
+            raise management_unauthorized()
+        except InsufficientManagementScopeError:
+            raise management_forbidden()
+        except ManagementIdentityProviderUnavailableError:
+            raise management_identity_unavailable()
 
     @router.get("/health")
     def health():

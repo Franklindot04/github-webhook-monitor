@@ -8,6 +8,7 @@ from app.domain.recovery_actions import (
     RECOVERY_ACTION_STATE_OUTCOME_UNKNOWN,
 )
 from app.domain.deliveries import DeliveryAttempt
+from app.domain.management import ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
 from app.integrations.github.client import (
     GitHubRedeliveryOutcomeUnknownError,
     GitHubRepositoryWebhookRedeliveryClient,
@@ -68,6 +69,7 @@ class GitHubRedeliveryService:
         *,
         attempt: DeliveryAttempt,
         github_delivery_id: int,
+        principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
     ) -> GitHubRedeliveryResult:
         if not self.enabled or self._github_redelivery_client is None:
             raise GitHubRedeliveryDisabledError
@@ -91,6 +93,7 @@ class GitHubRedeliveryService:
                 repository=f"{owner}/{repository}",
                 github_delivery_id=github_delivery_id,
                 requested_at=datetime.now(timezone.utc),
+                principal=principal,
             )
         except RecoveryActionStoreError as exc:
             raise GitHubRedeliveryJournalUnavailableError("Recovery action journal unavailable") from exc
@@ -126,7 +129,11 @@ class GitHubRedeliveryService:
             )
             raise
 
-        self._finalize_action(action_id=recovery_action.action_id, state=RECOVERY_ACTION_STATE_ACCEPTED)
+        self._finalize_action(
+            action_id=recovery_action.action_id,
+            state=RECOVERY_ACTION_STATE_ACCEPTED,
+            upstream_status_code=202,
+        )
         return GitHubRedeliveryResult(
             action_id=recovery_action.action_id,
             attempt=attempt,
