@@ -1,14 +1,19 @@
 from collections.abc import Callable
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
+from app.security import require_management_access
 from app.services.webhooks import (
     InvalidWebhookSignatureError,
     MalformedWebhookPayloadError,
     WebhookIngestionService,
 )
 from app.storage.deliveries import DeliveryStore, DeliveryStoreError, DeliveryStoreReadinessError
+
+
+management_bearer = HTTPBearer(auto_error=False)
 
 
 async def read_bounded_body(request: Request, max_body_bytes: int) -> bytes:
@@ -83,8 +88,19 @@ def create_router(
     delivery_store: DeliveryStore,
     readiness_check: Callable[[], None],
     max_webhook_body_bytes: int,
+    management_api_enabled: bool,
+    management_api_token: str | None,
 ) -> APIRouter:
     router = APIRouter()
+
+    async def require_configured_management_access(
+        credentials: HTTPAuthorizationCredentials | None = Depends(management_bearer),
+    ) -> None:
+        require_management_access(
+            management_api_enabled=management_api_enabled,
+            expected_token=management_api_token,
+            credentials=credentials,
+        )
 
     @router.get("/health")
     def health():
@@ -98,7 +114,7 @@ def create_router(
             raise HTTPException(status_code=503, detail="Service unavailable")
         return {"status": "ready"}
 
-    @router.get("/events")
+    @router.get("/events", dependencies=[Depends(require_configured_management_access)])
     async def get_events():
         try:
             recent_events = await run_in_threadpool(delivery_store.list_recent)

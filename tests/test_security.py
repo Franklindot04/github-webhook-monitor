@@ -1,7 +1,8 @@
 import hashlib
 import hmac
 
-from app.security import verify_github_signature
+import app.security as security
+from app.security import verify_github_signature, verify_management_token
 
 
 def signature_for(payload: bytes, secret: str) -> str:
@@ -71,3 +72,26 @@ def test_arbitrary_raw_bytes_are_verified_without_decoding():
     secret = "test-secret"
 
     assert verify_github_signature(payload, signature_for(payload, secret), secret) is True
+
+
+def test_management_token_uses_constant_time_comparison(monkeypatch):
+    calls = []
+
+    def fake_compare_digest(left, right):
+        calls.append((left, right))
+        return True
+
+    monkeypatch.setattr(security.hmac, "compare_digest", fake_compare_digest)
+
+    assert verify_management_token("provided-token", "expected-token") is True
+    assert calls == [(b"provided-token", b"expected-token")]
+
+
+def test_management_token_rejects_missing_values_without_comparison(monkeypatch):
+    def fail_if_called(left, right):
+        raise AssertionError("compare_digest should not be called for missing management tokens")
+
+    monkeypatch.setattr(security.hmac, "compare_digest", fail_if_called)
+
+    assert verify_management_token("", "expected-token") is False
+    assert verify_management_token("provided-token", "") is False

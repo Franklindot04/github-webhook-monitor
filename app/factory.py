@@ -46,6 +46,12 @@ def create_app(
             app_delivery_store,
             readiness_check=runtime_resources.readiness_check,
             max_webhook_body_bytes=app_settings.max_webhook_body_bytes,
+            management_api_enabled=app_settings.management_api_enabled,
+            management_api_token=(
+                app_settings.management_api_token.get_secret_value()
+                if app_settings.management_api_token is not None
+                else None
+            ),
         )
     )
     return app

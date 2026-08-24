@@ -8,6 +8,9 @@ from pydantic import ValidationError
 from app.config import Settings
 
 
+MANAGEMENT_TOKEN = "synthetic-management-token-000001"
+
+
 def test_valid_configuration():
     settings = Settings(
         webhook_secret="synthetic-secret",
@@ -91,6 +94,74 @@ def test_default_delivery_store_backend_is_memory():
     settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
 
     assert settings.delivery_store_backend == "memory"
+
+
+def test_management_api_is_disabled_by_default_and_token_is_optional():
+    settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
+
+    assert settings.management_api_enabled is False
+    assert settings.management_api_token is None
+
+
+def test_management_token_presence_alone_does_not_enable_management_api():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+
+    assert settings.management_api_enabled is False
+    assert settings.management_api_token is not None
+
+
+def test_management_api_requires_token_when_enabled():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            _env_file=None,
+        )
+
+    message = str(exc_info.value)
+    assert "MANAGEMENT_API_TOKEN is required" in message
+    assert MANAGEMENT_TOKEN not in message
+
+
+def test_management_api_accepts_enabled_with_token():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+
+    assert settings.management_api_enabled is True
+    assert settings.management_api_token is not None
+    assert settings.management_api_token.get_secret_value() == MANAGEMENT_TOKEN
+
+
+@pytest.mark.parametrize("token", ["", "short-management-token"])
+def test_management_token_must_meet_minimum_length(token):
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_api_token=token,
+            _env_file=None,
+        )
+
+
+def test_management_token_is_redacted_in_settings_representation():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+
+    representation = repr(settings)
+    assert MANAGEMENT_TOKEN not in representation
+    assert "**********" in representation
 
 
 def test_explicit_memory_backend_does_not_require_database_url():

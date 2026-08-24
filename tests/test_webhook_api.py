@@ -17,6 +17,7 @@ from app.storage.deliveries import DeliveryStoreError, InMemoryDeliveryStore
 
 
 TEST_SECRET = "test-webhook-secret"
+MANAGEMENT_TOKEN = "synthetic-management-token-000001"
 
 
 def encode_json(value: object) -> bytes:
@@ -25,6 +26,14 @@ def encode_json(value: object) -> bytes:
 
 def signature_for(payload: bytes, secret: str = TEST_SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def management_headers(token: str = MANAGEMENT_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_events(client: TestClient):
+    return client.get("/events", headers=management_headers())
 
 
 @pytest.fixture
@@ -38,6 +47,8 @@ def client(delivery_store):
         webhook_secret=TEST_SECRET,
         max_events=delivery_store.max_events,
         max_webhook_body_bytes=4096,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
         _env_file=None,
     )
     return TestClient(create_app(settings=settings, delivery_store=delivery_store))
@@ -361,7 +372,7 @@ def test_webhook_ingestion_uses_most_recent_first_ordering(client):
     assert first_response.status_code == 200
     assert second_response.status_code == 200
 
-    response = client.get("/events")
+    response = get_events(client)
 
     assert response.status_code == 200
     assert response.json()["count"] == 2
@@ -375,11 +386,168 @@ def test_events_endpoint_exposes_current_in_memory_collection(client):
     payload = encode_json({"action": "opened", "repository": {"full_name": "octo/example"}})
 
     webhook_response = post_webhook(client, payload)
-    events_response = client.get("/events")
+    events_response = get_events(client)
 
     assert webhook_response.status_code == 200
     assert events_response.status_code == 200
     assert events_response.json() == {"count": 1, "events": [webhook_response.json()["event"]]}
+
+
+def test_events_endpoint_is_not_available_when_management_api_is_disabled(delivery_store):
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get("/events")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not found"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Authorization": f"Bearer {MANAGEMENT_TOKEN}"},
+        {"Authorization": "Token synthetic-management-token-000001"},
+        {"Authorization": "Bearer"},
+    ],
+)
+def test_disabled_management_api_returns_not_found_before_credential_validation(delivery_store, headers):
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get("/events", headers=headers)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not found"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        None,
+        {"Authorization": "Bearer wrong-management-token-000001"},
+        {"Authorization": "Token synthetic-management-token-000001"},
+        {"Authorization": "Bearer"},
+    ],
+)
+def test_events_endpoint_requires_valid_management_bearer_token(delivery_store, headers):
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get("/events", headers=headers or {})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_github_webhook_secret_cannot_authenticate_management_endpoint(delivery_store):
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get("/events", headers=management_headers(TEST_SECRET))
+
+    assert response.status_code == 401
+
+
+class ListProbeDeliveryStore(InMemoryDeliveryStore):
+    def __init__(self):
+        super().__init__(max_events=50)
+        self.list_calls = 0
+
+    def list_recent(self):
+        self.list_calls += 1
+        return super().list_recent()
+
+
+@pytest.mark.parametrize(
+    ("management_api_enabled", "headers", "expected_status"),
+    [
+        (False, {}, 404),
+        (True, {}, 401),
+        (True, {"Authorization": "Bearer wrong-management-token-000001"}, 401),
+    ],
+)
+def test_unauthorized_management_requests_do_not_access_delivery_store(
+    management_api_enabled,
+    headers,
+    expected_status,
+):
+    store = ListProbeDeliveryStore()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=management_api_enabled,
+        management_api_token=MANAGEMENT_TOKEN if management_api_enabled else None,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = client.get("/events", headers=headers)
+
+    assert response.status_code == expected_status
+    assert store.list_calls == 0
+
+
+def test_valid_management_token_allows_events_store_access():
+    store = ListProbeDeliveryStore()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = get_events(client)
+
+    assert response.status_code == 200
+    assert response.json() == {"count": 0, "events": []}
+    assert store.list_calls == 1
+
+
+def test_events_openapi_declares_bearer_auth_when_management_enabled(delivery_store):
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    app = create_app(settings=settings, delivery_store=delivery_store)
+
+    openapi = app.openapi()
+
+    assert openapi["components"]["securitySchemes"]["HTTPBearer"] == {
+        "type": "http",
+        "scheme": "bearer",
+    }
+    assert openapi["paths"]["/events"]["get"]["security"] == [{"HTTPBearer": []}]
+
+
+def test_management_token_cannot_substitute_for_invalid_github_hmac(client, delivery_store):
+    payload = encode_json({"action": "opened"})
+
+    response = post_webhook(
+        client,
+        payload,
+        {
+            "X-Hub-Signature-256": f"sha256={MANAGEMENT_TOKEN}",
+            "Authorization": f"Bearer {MANAGEMENT_TOKEN}",
+        },
+    )
+
+    assert response.status_code == 401
+    assert delivery_store.list_recent() == []
 
 
 class FailingDeliveryStore:
@@ -418,10 +586,15 @@ def test_invalid_signature_does_not_become_persistence_failure():
 
 def test_events_endpoint_returns_service_unavailable_when_listing_fails():
     store = FailingDeliveryStore()
-    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
     client = TestClient(create_app(settings=settings, delivery_store=store))
 
-    response = client.get("/events")
+    response = get_events(client)
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Service unavailable"}
@@ -452,12 +625,17 @@ def _has_running_loop() -> bool:
 
 def test_webhook_and_events_store_calls_run_outside_active_event_loop():
     store = LoopRecordingDeliveryStore()
-    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
     client = TestClient(create_app(settings=settings, delivery_store=store))
     payload = encode_json({"action": "opened"})
 
     webhook_response = post_webhook(client, payload)
-    events_response = client.get("/events")
+    events_response = get_events(client)
 
     assert webhook_response.status_code == 200
     assert events_response.status_code == 200
@@ -597,7 +775,7 @@ def test_duplicate_delivery_id_is_not_rejected_during_stage_4(client):
 
     assert first_response.status_code == 200
     assert second_response.status_code == 200
-    events = client.get("/events").json()["events"]
+    events = get_events(client).json()["events"]
     assert [event["delivery_id"] for event in events] == [
         "same-delivery-id",
         "same-delivery-id",
@@ -623,7 +801,7 @@ def test_same_delivery_id_with_different_payloads_keeps_distinct_attempt_digests
 
     assert first_response.status_code == 200
     assert second_response.status_code == 200
-    events = client.get("/events").json()["events"]
+    events = get_events(client).json()["events"]
     assert events[0]["delivery_id"] == events[1]["delivery_id"] == "same-delivery-id"
     assert events[0]["attempt_id"] != events[1]["attempt_id"]
     assert events[0]["payload_sha256"] == hashlib.sha256(second_payload).hexdigest()
@@ -632,7 +810,13 @@ def test_same_delivery_id_with_different_payloads_keeps_distinct_attempt_digests
 
 
 def test_attempt_based_capacity_does_not_keep_unbounded_history():
-    settings = Settings(webhook_secret=TEST_SECRET, max_events=2, _env_file=None)
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        max_events=2,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
     delivery_store = InMemoryDeliveryStore(max_events=2)
     client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
 
@@ -649,7 +833,7 @@ def test_attempt_based_capacity_does_not_keep_unbounded_history():
         )
         assert response.status_code == 200
 
-    events = client.get("/events").json()["events"]
+    events = get_events(client).json()["events"]
     assert [event["action"] for event in events] == ["third", "second"]
     assert [event["delivery_id"] for event in events] == ["delivery-b", "delivery-a"]
 
