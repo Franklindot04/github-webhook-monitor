@@ -1,16 +1,18 @@
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, PositiveInt, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.persistence.database import POSTGRESQL_PSYCOPG_SCHEME
-from app.security import MIN_MANAGEMENT_API_TOKEN_LENGTH
+from app.security import MIN_MANAGEMENT_API_TOKEN_LENGTH, parse_allowed_jwt_algorithms
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 DeliveryStoreBackend = Literal["memory", "postgresql"]
+ManagementAuthMode = Literal["shared_token", "oidc_jwt"]
 
 
 class Settings(BaseSettings):
@@ -29,7 +31,13 @@ class Settings(BaseSettings):
     database_url: SecretStr | None = None
     database_connect_timeout_seconds: PositiveInt = 5
     management_api_enabled: bool = False
+    management_auth_mode: ManagementAuthMode = "shared_token"
     management_api_token: SecretStr | None = None
+    management_oidc_issuer: str | None = None
+    management_oidc_audience: str | None = None
+    management_oidc_required_scope: str = "webhook-monitor.manage"
+    management_oidc_allowed_algorithms: str = "RS256"
+    management_oidc_http_timeout_seconds: PositiveInt = 5
     github_reconciliation_enabled: bool = False
     github_repository_webhook_token: SecretStr | None = None
     github_redelivery_enabled: bool = False
@@ -46,7 +54,7 @@ class Settings(BaseSettings):
             if not database_url.startswith(POSTGRESQL_PSYCOPG_SCHEME):
                 raise ValueError("DATABASE_URL must use postgresql+psycopg when DELIVERY_STORE_BACKEND=postgresql")
 
-        if self.management_api_enabled and self.management_api_token is None:
+        if self.management_api_enabled and self.management_auth_mode == "shared_token" and self.management_api_token is None:
             raise ValueError("MANAGEMENT_API_TOKEN is required when MANAGEMENT_API_ENABLED=true")
         if self.management_api_token is not None:
             management_token = self.management_api_token.get_secret_value()
@@ -54,6 +62,17 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"MANAGEMENT_API_TOKEN must be at least {MIN_MANAGEMENT_API_TOKEN_LENGTH} characters"
                 )
+        if self.management_api_enabled and self.management_auth_mode == "oidc_jwt":
+            if self.management_oidc_issuer is None:
+                raise ValueError("MANAGEMENT_OIDC_ISSUER is required when MANAGEMENT_AUTH_MODE=oidc_jwt")
+            if self.management_oidc_audience is None:
+                raise ValueError("MANAGEMENT_OIDC_AUDIENCE is required when MANAGEMENT_AUTH_MODE=oidc_jwt")
+            validate_oidc_issuer(self.management_oidc_issuer)
+            if not self.management_oidc_audience.strip():
+                raise ValueError("MANAGEMENT_OIDC_AUDIENCE must not be blank")
+            if not self.management_oidc_required_scope.strip():
+                raise ValueError("MANAGEMENT_OIDC_REQUIRED_SCOPE must not be blank")
+            parse_allowed_jwt_algorithms(self.management_oidc_allowed_algorithms)
         if self.github_reconciliation_enabled:
             if not self.management_api_enabled:
                 raise ValueError("MANAGEMENT_API_ENABLED=true is required when GITHUB_RECONCILIATION_ENABLED=true")
@@ -71,3 +90,14 @@ class Settings(BaseSettings):
                     "GITHUB_REPOSITORY_WEBHOOK_WRITE_TOKEN is required when GITHUB_REDELIVERY_ENABLED=true"
                 )
         return self
+
+
+def validate_oidc_issuer(value: str) -> None:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("MANAGEMENT_OIDC_ISSUER must be an HTTPS issuer URI without query or fragment")

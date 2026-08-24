@@ -13,6 +13,7 @@ from app.api.v1.models import (
     RecoveryActionsListResponse,
 )
 from app.domain.deliveries import DeliveryAttempt
+from app.domain.management import ManagementPrincipal
 from app.domain.recovery_actions import RecoveryAction
 from app.integrations.github.models import GitHubDeliverySummary
 from app.services.delivery_queries import (
@@ -91,6 +92,9 @@ def recovery_action_to_response(action: RecoveryAction) -> RecoveryActionRespons
         repository=action.repository,
         github_delivery_id=action.github_delivery_id,
         authentication_method=action.authentication_method,
+        principal_issuer=action.principal_issuer,
+        principal_subject=action.principal_subject,
+        principal_client_id=action.principal_client_id,
         state=action.state,
         upstream_status_code=action.upstream_status_code,
         failure_category=action.failure_category,
@@ -225,6 +229,7 @@ def create_delivery_attempts_router(
         summary="Request GitHub to redeliver one verified repository webhook delivery",
     )
     async def request_github_redelivery(
+        principal: ManagementPrincipal = Depends(management_access_dependency),
         attempt_id: str = Path(
             description="Application-owned delivery attempt UUID.",
             json_schema_extra={"format": "uuid"},
@@ -257,6 +262,7 @@ def create_delivery_attempts_router(
             result = await redelivery_service.request_redelivery(
                 attempt=attempt,
                 github_delivery_id=parsed_github_delivery_id,
+                principal=principal,
             )
         except GitHubRedeliveryDisabledError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")

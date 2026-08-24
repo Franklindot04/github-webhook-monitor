@@ -232,6 +232,24 @@ If you are testing locally, you can expose your development server with a tunnel
 - Avoid placing secrets or credentials in the payload URL.
 - Generate production management tokens as high-entropy operator credentials using an appropriate secret-management process.
 
+## Management identity
+
+Management endpoints use Bearer authentication. The configured `MANAGEMENT_AUTH_MODE` selects exactly one authoritative credential mode.
+
+`shared_token` is the default and preserves the original shared management credential contract. It requires `MANAGEMENT_API_TOKEN` when the management API is enabled. This mode proves that a request has authenticated management access, but it does not identify an individual management principal. Recovery-action records created in this mode use `authentication_method = management_bearer` and leave principal fields empty.
+
+`oidc_jwt` configures the service as an OAuth resource server for externally issued JWT access tokens compatible with the RFC 9068 JWT Access Token Profile. The service does not issue tokens, run browser login, use sessions, perform token exchange, or call UserInfo. Token acquisition happens outside this service.
+
+OIDC JWT mode requires a trusted HTTPS issuer, expected audience, required coarse management scope, and explicit asymmetric signing-algorithm allowlist. The service obtains OpenID Provider metadata from the configured issuer, validates that metadata issuer exactly matches configuration, and uses only the validated HTTPS `jwks_uri` for signature keys. Incoming tokens cannot choose key URLs through JWT headers or claims.
+
+Strict access-token validation requires `typ = at+jwt` or `typ = application/at+jwt`, an allowlisted asymmetric algorithm such as `RS256`, a valid signature, exact issuer match, expected audience, unexpired `exp`, valid `iat`, valid `nbf` when present, non-empty `sub`, non-empty `client_id`, non-empty `jti`, and the configured management scope such as `webhook-monitor.manage`. A signed OIDC ID-token-style JWT is not accepted as a management access token.
+
+When OIDC JWT mode authenticates a request, the management principal is represented by the stable pair `issuer + subject`. The `client_id` is supplementary OAuth client attribution, not the principal identity. The principal may represent an individual, workload, client, or another authorization-server principal type. Stage 13 does not implement role mapping, fine-grained route permissions, or RBAC; it checks one coarse management scope only.
+
+The service validates `jti` because the selected access-token profile requires it, but does not persist it, log it, use it for replay detection, or turn it into idempotency. The service does not persist raw access tokens, full JWT claims, email, name, username, profile data, groups, or refresh tokens. Future recovery-action records created through OIDC JWT mode snapshot only the authentication method plus principal issuer, subject, and client ID.
+
+Identity-provider availability is isolated to management requests that need OIDC authentication. The service does not contact the provider during import, application startup, `/health`, `/ready`, or `POST /webhook/github`.
+
 ## Delivery ledger model
 
 GitHub's `X-GitHub-Delivery` value identifies the logical upstream delivery. This receiver assigns a separate application-owned attempt ID to each accepted receipt it observes.
@@ -298,7 +316,7 @@ MANAGEMENT_API_TOKEN=replace-with-a-high-entropy-management-token-000001
 Authorization: Bearer <management-token>
 ```
 
-Missing, malformed, or incorrect bearer credentials return `401 Unauthorized` with a generic response. The GitHub webhook secret does not authenticate management endpoints, and the management bearer token does not authenticate webhook ingress. The current bearer-token boundary is a management-plane authentication foundation; future production authorization concerns such as OIDC, SSO, multiple operators, roles, scopes, and audit identity are intentionally deferred.
+Missing, malformed, or incorrect bearer credentials return `401 Unauthorized` with a generic response. The GitHub webhook secret does not authenticate management endpoints, and management bearer credentials do not authenticate webhook ingress. Federated JWT mode can identify a management principal, but browser SSO login, multiple local operators, role mapping, and fine-grained management authorization remain deferred.
 
 ## Preferred management diagnostics API
 
@@ -433,7 +451,7 @@ The recovery action journal records privileged control-plane intent and outcome 
 
 For controlled repository-webhook redelivery, the application validates the local attempt, repository target, and exact upstream `github_delivery_id` first. It then writes an initiated recovery action before the GitHub mutation POST. If that journal write fails, the GitHub mutation is not sent. After the single POST attempt, the action is finalized as `accepted`, `failed`, or `outcome_unknown`.
 
-Journal entries expose an application-owned `action_id`, action type `github_repository_webhook_redelivery`, timestamps, target snapshot fields, authentication method, state, optional upstream status code, and a bounded failure category. They do not expose database surrogate IDs, tokens, webhook secrets, raw webhook bodies, authorization headers, raw GitHub error responses, or GitHub stored webhook payloads.
+Journal entries expose an application-owned `action_id`, action type `github_repository_webhook_redelivery`, timestamps, target snapshot fields, authentication method, optional principal snapshot fields, state, optional upstream status code, and a bounded failure category. They do not expose database surrogate IDs, tokens, webhook secrets, raw webhook bodies, authorization headers, raw GitHub error responses, raw JWTs, full JWT claims, or GitHub stored webhook payloads.
 
 Terminal states are intentionally conservative:
 
@@ -447,7 +465,7 @@ Each authenticated management POST is a distinct action with a distinct `action_
 
 PostgreSQL runtime persists recovery-action history across application restarts. Memory runtime keeps a non-durable in-process journal for local runtime behavior and tests; it does not survive restart. Production-grade durable action history requires PostgreSQL runtime.
 
-The current management bearer authenticates access but does not provide per-human operator identity. The journal can prove an authenticated management action occurred; it cannot yet prove which individual person performed it. Individual operator identity and role-based authorization remain deferred.
+Shared management bearer authentication does not provide per-principal identity. OIDC JWT mode records the verified issuer and subject for future recovery actions, but this is a management principal identity rather than a guaranteed human identity. Fine-grained authorization remains deferred.
 
 Read-only journal endpoints are management-authenticated:
 

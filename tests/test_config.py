@@ -102,6 +102,7 @@ def test_management_api_is_disabled_by_default_and_token_is_optional():
     settings = Settings(webhook_secret="synthetic-secret", _env_file=None)
 
     assert settings.management_api_enabled is False
+    assert settings.management_auth_mode == "shared_token"
     assert settings.management_api_token is None
 
 
@@ -140,6 +141,70 @@ def test_management_api_accepts_enabled_with_token():
     assert settings.management_api_enabled is True
     assert settings.management_api_token is not None
     assert settings.management_api_token.get_secret_value() == MANAGEMENT_TOKEN
+
+
+def test_oidc_management_mode_requires_federated_settings_without_shared_token():
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_auth_mode="oidc_jwt",
+            _env_file=None,
+        )
+
+    assert "MANAGEMENT_OIDC_ISSUER is required" in str(exc_info.value)
+
+
+def test_oidc_management_mode_accepts_required_settings_without_shared_token():
+    settings = Settings(
+        webhook_secret="synthetic-secret",
+        management_api_enabled=True,
+        management_auth_mode="oidc_jwt",
+        management_oidc_issuer="https://identity.example.com/",
+        management_oidc_audience="https://github-webhook-monitor.example/",
+        _env_file=None,
+    )
+
+    assert settings.management_auth_mode == "oidc_jwt"
+    assert settings.management_api_token is None
+    assert settings.management_oidc_required_scope == "webhook-monitor.manage"
+    assert settings.management_oidc_allowed_algorithms == "RS256"
+    assert settings.management_oidc_http_timeout_seconds == 5
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://identity.example.com/",
+        "https://identity.example.com/?tenant=example",
+        "https://identity.example.com/#fragment",
+        "not-a-url",
+    ],
+)
+def test_oidc_management_issuer_must_be_https_without_query_or_fragment(issuer):
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_auth_mode="oidc_jwt",
+            management_oidc_issuer=issuer,
+            management_oidc_audience="https://github-webhook-monitor.example/",
+            _env_file=None,
+        )
+
+
+@pytest.mark.parametrize("algorithms", ["", "none", "HS256", "RS256,HS256"])
+def test_oidc_management_algorithm_allowlist_rejects_empty_none_or_symmetric(algorithms):
+    with pytest.raises(ValidationError):
+        Settings(
+            webhook_secret="synthetic-secret",
+            management_api_enabled=True,
+            management_auth_mode="oidc_jwt",
+            management_oidc_issuer="https://identity.example.com/",
+            management_oidc_audience="https://github-webhook-monitor.example/",
+            management_oidc_allowed_algorithms=algorithms,
+            _env_file=None,
+        )
 
 
 @pytest.mark.parametrize("token", ["", "short-management-token"])

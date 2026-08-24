@@ -97,6 +97,9 @@ recovery_actions = Table(
     Column("repository", Text, nullable=False),
     Column("github_delivery_id", BigInteger, nullable=False),
     Column("authentication_method", Text, nullable=False),
+    Column("principal_issuer", Text, nullable=True),
+    Column("principal_subject", Text, nullable=True),
+    Column("principal_client_id", Text, nullable=True),
     Column("state", Text, nullable=False),
     Column("upstream_status_code", BigInteger, nullable=True),
     Column("failure_category", Text, nullable=True),
@@ -109,7 +112,7 @@ recovery_actions = Table(
         name="ck_recovery_actions_state",
     ),
     CheckConstraint(
-        "authentication_method = 'management_bearer'",
+        "authentication_method IN ('management_bearer', 'oidc_jwt')",
         name="ck_recovery_actions_authentication_method",
     ),
     CheckConstraint("length(btrim(delivery_guid)) > 0", name="ck_recovery_actions_delivery_guid_not_blank"),

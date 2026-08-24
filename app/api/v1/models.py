@@ -70,6 +70,9 @@ class RecoveryActionResponse(BaseModel):
     repository: str
     github_delivery_id: int
     authentication_method: str
+    principal_issuer: str | None
+    principal_subject: str | None
+    principal_client_id: str | None
     state: str
     upstream_status_code: int | None
     failure_category: str | None

@@ -5,6 +5,7 @@ from typing import Protocol
 from uuid import UUID, uuid4
 
 from app.domain.deliveries import DeliveryAttempt
+from app.domain.management import ManagementPrincipal, SHARED_TOKEN_PRINCIPAL
 from app.domain.recovery_actions import (
     RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
     RECOVERY_ACTION_STATE_INITIATED,
@@ -40,6 +41,7 @@ class RecoveryActionStore(Protocol):
         repository: str,
         github_delivery_id: int,
         requested_at: datetime,
+        principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
     ) -> RecoveryAction:
         ...
 
@@ -79,6 +81,7 @@ class InMemoryRecoveryActionStore:
         repository: str,
         github_delivery_id: int,
         requested_at: datetime,
+        principal: ManagementPrincipal = SHARED_TOKEN_PRINCIPAL,
     ) -> RecoveryAction:
         action = RecoveryAction(
             action_id=uuid4(),
@@ -90,7 +93,10 @@ class InMemoryRecoveryActionStore:
             hook_id=attempt.delivery_identity.hook_id,
             repository=repository,
             github_delivery_id=github_delivery_id,
-            authentication_method=RECOVERY_ACTION_AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
+            authentication_method=principal.authentication_method,
+            principal_issuer=principal.issuer,
+            principal_subject=principal.subject,
+            principal_client_id=principal.client_id,
             state=RECOVERY_ACTION_STATE_INITIATED,
             upstream_status_code=None,
             failure_category=None,
@@ -123,6 +129,9 @@ class InMemoryRecoveryActionStore:
                 repository=action.repository,
                 github_delivery_id=action.github_delivery_id,
                 authentication_method=action.authentication_method,
+                principal_issuer=action.principal_issuer,
+                principal_subject=action.principal_subject,
+                principal_client_id=action.principal_client_id,
                 state=state,
                 upstream_status_code=upstream_status_code,
                 failure_category=failure_category,
@@ -155,4 +164,3 @@ class InMemoryRecoveryActionStore:
                 if (action.requested_at, action.action_id) < (after.requested_at, after.action_id)
             ]
         return ordered_actions[:limit]
-
