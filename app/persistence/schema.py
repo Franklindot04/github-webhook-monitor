@@ -75,3 +75,9 @@ Index(
     delivery_attempts.c.received_at.desc(),
     delivery_attempts.c.id.desc(),
 )
+
+Index(
+    "ix_delivery_attempts_diagnostics_keyset",
+    delivery_attempts.c.received_at.desc(),
+    delivery_attempts.c.attempt_id.desc(),
+)

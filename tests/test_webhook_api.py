@@ -36,6 +36,10 @@ def get_events(client: TestClient):
     return client.get("/events", headers=management_headers())
 
 
+def get_delivery_attempts(client: TestClient, query: str = ""):
+    return client.get(f"/api/v1/delivery-attempts{query}", headers=management_headers())
+
+
 @pytest.fixture
 def delivery_store():
     return InMemoryDeliveryStore(max_events=50)
@@ -465,10 +469,20 @@ class ListProbeDeliveryStore(InMemoryDeliveryStore):
     def __init__(self):
         super().__init__(max_events=50)
         self.list_calls = 0
+        self.page_calls = 0
+        self.lookup_calls = 0
 
     def list_recent(self):
         self.list_calls += 1
         return super().list_recent()
+
+    def list_attempts_page(self, *, limit, after=None):
+        self.page_calls += 1
+        return super().list_attempts_page(limit=limit, after=after)
+
+    def get_attempt(self, attempt_id):
+        self.lookup_calls += 1
+        return super().get_attempt(attempt_id)
 
 
 @pytest.mark.parametrize(
@@ -497,6 +511,37 @@ def test_unauthorized_management_requests_do_not_access_delivery_store(
 
     assert response.status_code == expected_status
     assert store.list_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "management_api_enabled", "headers", "expected_status"),
+    [
+        ("/api/v1/delivery-attempts", False, {}, 404),
+        ("/api/v1/delivery-attempts", True, {}, 401),
+        ("/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001", False, {}, 404),
+        ("/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001", True, {}, 401),
+    ],
+)
+def test_unauthorized_v1_management_requests_do_not_access_delivery_store(
+    path,
+    management_api_enabled,
+    headers,
+    expected_status,
+):
+    store = ListProbeDeliveryStore()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=management_api_enabled,
+        management_api_token=MANAGEMENT_TOKEN if management_api_enabled else None,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = client.get(path, headers=headers)
+
+    assert response.status_code == expected_status
+    assert store.page_calls == 0
+    assert store.lookup_calls == 0
 
 
 def test_valid_management_token_allows_events_store_access():
@@ -532,6 +577,176 @@ def test_events_openapi_declares_bearer_auth_when_management_enabled(delivery_st
         "scheme": "bearer",
     }
     assert openapi["paths"]["/events"]["get"]["security"] == [{"HTTPBearer": []}]
+    assert openapi["paths"]["/events"]["get"]["deprecated"] is True
+    assert openapi["paths"]["/api/v1/delivery-attempts"]["get"]["security"] == [{"HTTPBearer": []}]
+    assert openapi["paths"]["/api/v1/delivery-attempts/{attempt_id}"]["get"]["security"] == [{"HTTPBearer": []}]
+    list_parameters = {
+        parameter["name"]: parameter
+        for parameter in openapi["paths"]["/api/v1/delivery-attempts"]["get"]["parameters"]
+    }
+    assert list_parameters["limit"]["in"] == "query"
+    assert list_parameters["limit"]["required"] is False
+    assert list_parameters["limit"]["schema"]["anyOf"][0]["type"] == "string"
+    assert "integer from 1 to 100" in list_parameters["limit"]["description"]
+    assert "Defaults to 50" in list_parameters["limit"]["description"]
+    assert list_parameters["cursor"]["in"] == "query"
+    assert list_parameters["cursor"]["required"] is False
+    assert "Opaque pagination cursor" in list_parameters["cursor"]["description"]
+    detail_parameters = {
+        parameter["name"]: parameter
+        for parameter in openapi["paths"]["/api/v1/delivery-attempts/{attempt_id}"]["get"]["parameters"]
+    }
+    assert detail_parameters["attempt_id"]["in"] == "path"
+    assert detail_parameters["attempt_id"]["required"] is True
+    assert detail_parameters["attempt_id"]["schema"]["type"] == "string"
+    assert detail_parameters["attempt_id"]["schema"]["format"] == "uuid"
+    assert "delivery attempt UUID" in detail_parameters["attempt_id"]["description"]
+
+
+def test_delivery_attempts_list_endpoint_returns_v1_response_shape(client):
+    first_payload = encode_json({"action": "opened", "repository": {"full_name": "octo/one"}})
+    second_payload = encode_json({"action": "closed", "sender": {"login": "octocat"}})
+    first_response = post_webhook(
+        client,
+        first_payload,
+        {"X-GitHub-Delivery": "delivery-001", "X-Hub-Signature-256": signature_for(first_payload)},
+    )
+    second_response = post_webhook(
+        client,
+        second_payload,
+        {"X-GitHub-Delivery": "delivery-002", "X-Hub-Signature-256": signature_for(second_payload)},
+    )
+
+    response = get_delivery_attempts(client, "?limit=1")
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["next_cursor"] is not None
+    item = body["items"][0]
+    assert item["attempt_id"] == second_response.json()["event"]["attempt_id"]
+    assert item["delivery_guid"] == "delivery-002"
+    assert item["hook_id"] == 12345
+    assert item["event_type"] == "pull_request"
+    assert item["payload_sha256"] == hashlib.sha256(second_payload).hexdigest()
+    assert "delivery_id" not in item
+    assert "id" not in item
+    assert "raw_payload" not in item
+    assert "signature" not in item
+
+
+def test_delivery_attempts_list_traverses_pages_without_duplicates(client):
+    attempt_ids = []
+    for index in range(3):
+        payload = encode_json({"action": f"event-{index}"})
+        response = post_webhook(
+            client,
+            payload,
+            {
+                "X-GitHub-Delivery": f"delivery-{index}",
+                "X-Hub-Signature-256": signature_for(payload),
+            },
+        )
+        assert response.status_code == 200
+        attempt_ids.append(response.json()["event"]["attempt_id"])
+
+    first_page = get_delivery_attempts(client, "?limit=2").json()
+    second_page = get_delivery_attempts(client, f"?limit=2&cursor={first_page['next_cursor']}").json()
+    traversed_attempt_ids = [item["attempt_id"] for item in first_page["items"] + second_page["items"]]
+
+    assert traversed_attempt_ids == list(reversed(attempt_ids))
+    assert len(traversed_attempt_ids) == len(set(traversed_attempt_ids))
+    assert second_page["next_cursor"] is None
+
+
+def test_delivery_attempts_detail_endpoint_finds_attempt_by_attempt_id(client):
+    payload = encode_json({"action": "opened"})
+    webhook_response = post_webhook(client, payload)
+    attempt_id = webhook_response.json()["event"]["attempt_id"]
+
+    response = client.get(f"/api/v1/delivery-attempts/{attempt_id}", headers=management_headers())
+
+    assert response.status_code == 200
+    assert response.json()["attempt_id"] == attempt_id
+    assert response.json()["delivery_guid"] == "delivery-001"
+
+
+def test_delivery_attempts_detail_valid_absent_uuid_returns_not_found(client):
+    response = client.get(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000999",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Delivery attempt not found"}
+
+
+def test_delivery_attempts_detail_malformed_uuid_returns_controlled_validation(client):
+    response = client.get("/api/v1/delivery-attempts/not-a-uuid", headers=management_headers())
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid attempt_id"}
+
+
+def test_delivery_attempts_malformed_cursor_returns_bad_request(client):
+    response = get_delivery_attempts(client, "?cursor=not-valid")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid or expired cursor"}
+
+
+@pytest.mark.parametrize("query", ["?limit=0", "?limit=101", "?limit=abc"])
+def test_delivery_attempts_invalid_limit_returns_validation_error(client, query):
+    response = get_delivery_attempts(client, query)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid limit"}
+
+
+@pytest.mark.parametrize(
+    ("path", "headers"),
+    [
+        ("/api/v1/delivery-attempts?limit=0&cursor=not-valid", {}),
+        ("/api/v1/delivery-attempts/not-a-uuid", {"Authorization": f"Bearer {MANAGEMENT_TOKEN}"}),
+    ],
+)
+def test_disabled_management_api_hides_v1_diagnostics_before_parameter_validation(
+    delivery_store,
+    path,
+    headers,
+):
+    settings = Settings(webhook_secret=TEST_SECRET, _env_file=None)
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get(path, headers=headers)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not found"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/delivery-attempts?limit=0&cursor=not-valid",
+        "/api/v1/delivery-attempts/not-a-uuid",
+    ],
+)
+def test_unauthorized_v1_diagnostics_reject_before_parameter_validation(delivery_store, path):
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=delivery_store))
+
+    response = client.get(path)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+    assert response.headers["www-authenticate"] == "Bearer"
 
 
 def test_management_token_cannot_substitute_for_invalid_github_hmac(client, delivery_store):
@@ -557,6 +772,12 @@ class FailingDeliveryStore:
         raise DeliveryStoreError("synthetic storage failure")
 
     def list_recent(self):
+        raise DeliveryStoreError("synthetic storage failure")
+
+    def list_attempts_page(self, *, limit, after=None):
+        raise DeliveryStoreError("synthetic storage failure")
+
+    def get_attempt(self, attempt_id):
         raise DeliveryStoreError("synthetic storage failure")
 
 
@@ -600,6 +821,41 @@ def test_events_endpoint_returns_service_unavailable_when_listing_fails():
     assert response.json() == {"detail": "Service unavailable"}
 
 
+def test_delivery_attempts_list_returns_service_unavailable_when_listing_fails():
+    store = FailingDeliveryStore()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = get_delivery_attempts(client)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service unavailable"}
+
+
+def test_delivery_attempts_detail_returns_service_unavailable_when_lookup_fails():
+    store = FailingDeliveryStore()
+    settings = Settings(
+        webhook_secret=TEST_SECRET,
+        management_api_enabled=True,
+        management_api_token=MANAGEMENT_TOKEN,
+        _env_file=None,
+    )
+    client = TestClient(create_app(settings=settings, delivery_store=store))
+
+    response = client.get(
+        "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001",
+        headers=management_headers(),
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service unavailable"}
+
+
 class LoopRecordingDeliveryStore:
     def __init__(self):
         self.add_ran_without_active_loop: bool | None = None
@@ -613,6 +869,12 @@ class LoopRecordingDeliveryStore:
     def list_recent(self):
         self.list_ran_without_active_loop = not _has_running_loop()
         return self._store.list_recent()
+
+    def list_attempts_page(self, *, limit, after=None):
+        return self._store.list_attempts_page(limit=limit, after=after)
+
+    def get_attempt(self, attempt_id):
+        return self._store.get_attempt(attempt_id)
 
 
 def _has_running_loop() -> bool:
