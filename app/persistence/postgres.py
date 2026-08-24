@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import Engine, Select, select
 from sqlalchemy.dialects.postgresql import insert
@@ -7,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
 from app.persistence.schema import delivery_attempts, github_deliveries
-from app.storage.deliveries import DeliveryStore, DeliveryStoreError
+from app.storage.deliveries import DeliveryAttemptKeyset, DeliveryStore, DeliveryStoreError
 
 
 def _installation_target_id_to_db(value: str | None) -> int | None:
@@ -109,8 +110,64 @@ class PostgresDeliveryStore(DeliveryStore):
             raise DeliveryStoreError("Delivery store operation failed") from exc
         return [row_to_delivery_attempt(row) for row in rows]
 
+    def list_attempts_page(
+        self,
+        *,
+        limit: int,
+        after: DeliveryAttemptKeyset | None = None,
+    ) -> list[DeliveryAttempt]:
+        statement = _attempts_page_statement(limit=limit, after=after)
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(statement).mappings().all()
+        except SQLAlchemyError as exc:
+            raise DeliveryStoreError("Delivery store operation failed") from exc
+        return [row_to_delivery_attempt(row) for row in rows]
+
+    def get_attempt(self, attempt_id: UUID) -> DeliveryAttempt | None:
+        statement = _attempt_by_id_statement(attempt_id)
+        try:
+            with self._engine.connect() as connection:
+                row = connection.execute(statement).mappings().one_or_none()
+        except SQLAlchemyError as exc:
+            raise DeliveryStoreError("Delivery store operation failed") from exc
+        if row is None:
+            return None
+        return row_to_delivery_attempt(row)
+
 
 def _recent_attempts_statement(limit: int) -> Select[tuple[Any, ...]]:
+    return _base_attempts_statement().order_by(
+        delivery_attempts.c.received_at.desc(),
+        delivery_attempts.c.id.desc(),
+    ).limit(limit)
+
+
+def _attempts_page_statement(
+    *,
+    limit: int,
+    after: DeliveryAttemptKeyset | None,
+) -> Select[tuple[Any, ...]]:
+    statement = _base_attempts_statement()
+    if after is not None:
+        statement = statement.where(
+            (delivery_attempts.c.received_at < after.received_at)
+            | (
+                (delivery_attempts.c.received_at == after.received_at)
+                & (delivery_attempts.c.attempt_id < after.attempt_id)
+            )
+        )
+    return statement.order_by(
+        delivery_attempts.c.received_at.desc(),
+        delivery_attempts.c.attempt_id.desc(),
+    ).limit(limit)
+
+
+def _attempt_by_id_statement(attempt_id: UUID) -> Select[tuple[Any, ...]]:
+    return _base_attempts_statement().where(delivery_attempts.c.attempt_id == attempt_id)
+
+
+def _base_attempts_statement() -> Select[tuple[Any, ...]]:
     return (
         select(
             delivery_attempts.c.attempt_id,
@@ -131,6 +188,4 @@ def _recent_attempts_statement(limit: int) -> Select[tuple[Any, ...]]:
                 delivery_attempts.c.github_delivery_id == github_deliveries.c.id,
             )
         )
-        .order_by(delivery_attempts.c.received_at.desc(), delivery_attempts.c.id.desc())
-        .limit(limit)
     )

@@ -115,7 +115,9 @@ Once the server is running, you can open:
 |---|---|---|
 | GET | `/health` | Liveness check endpoint |
 | GET | `/ready` | Runtime dependency readiness endpoint |
-| GET | `/events` | Management endpoint for recent stored webhook delivery attempt summaries |
+| GET | `/api/v1/delivery-attempts` | Preferred management diagnostics endpoint for paginated delivery attempts |
+| GET | `/api/v1/delivery-attempts/{attempt_id}` | Preferred management diagnostics endpoint for one delivery attempt |
+| GET | `/events` | Deprecated compatibility endpoint for recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
 ## Endpoint classes
@@ -131,6 +133,8 @@ Webhook ingress:
 
 Management plane:
 
+- `GET /api/v1/delivery-attempts`
+- `GET /api/v1/delivery-attempts/{attempt_id}`
 - `GET /events`
 
 ## Local webhook test
@@ -287,6 +291,55 @@ Authorization: Bearer <management-token>
 ```
 
 Missing, malformed, or incorrect bearer credentials return `401 Unauthorized` with a generic response. The GitHub webhook secret does not authenticate management endpoints, and the management bearer token does not authenticate webhook ingress. The current bearer-token boundary is a management-plane authentication foundation; future production authorization concerns such as OIDC, SSO, multiple operators, roles, scopes, and audit identity are intentionally deferred.
+
+## Preferred management diagnostics API
+
+Use the versioned management diagnostics API for read-only delivery-attempt inspection:
+
+- `GET /api/v1/delivery-attempts`
+- `GET /api/v1/delivery-attempts/{attempt_id}`
+
+The list endpoint returns recent observed receipt attempts in deterministic recent-first order. Responses include the application-owned `attempt_id`, GitHub logical delivery identity fields `delivery_guid` and `hook_id`, `received_at`, `payload_sha256`, event metadata, repository, sender, and installation target metadata. Responses do not include raw webhook bodies, HMAC signatures, authorization headers, database surrogate IDs, or database connection details.
+
+Pagination uses `limit` and an opaque `cursor`:
+
+- `limit` defaults to `50`.
+- `limit` must be between `1` and `100`.
+- `cursor` is returned as `next_cursor` when another page is available.
+- Clients must not parse or construct cursor values.
+- Invalid cursor values return `400 Bad Request`.
+
+Example response:
+
+```json
+{
+  "items": [
+    {
+      "attempt_id": "00000000-0000-0000-0000-000000000002",
+      "delivery_guid": "synthetic-delivery-guid-002",
+      "hook_id": 12345,
+      "received_at": "2026-08-24T12:00:00Z",
+      "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "event_type": "pull_request",
+      "action": "opened",
+      "repository": "octo/example",
+      "sender": "octocat",
+      "installation_target_id": "67890",
+      "installation_target_type": "repository"
+    }
+  ],
+  "next_cursor": "opaque-cursor-value"
+}
+```
+
+The detail endpoint looks up one observed receiver attempt by `attempt_id`. A syntactically valid but absent attempt ID returns `404 Not Found`.
+
+Backend behavior differs only by retention boundary:
+
+- Memory mode is bounded by `MAX_EVENTS`; pagination traverses only currently retained attempts.
+- PostgreSQL mode traverses durable delivery-attempt history; page limits do not delete rows and `MAX_EVENTS` is not a PostgreSQL retention policy.
+
+`GET /events` remains supported as a compatibility endpoint under the same management authentication contract, but it is deprecated in favor of the v1 diagnostics API. No removal date is set.
 
 ## Repository files
 

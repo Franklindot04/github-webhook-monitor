@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
 from app.persistence.postgres import PostgresDeliveryStore
 from app.persistence.schema import delivery_attempts, github_deliveries
-from app.storage.deliveries import DeliveryStoreError
+from app.storage.deliveries import DeliveryAttemptKeyset, DeliveryStoreError, InMemoryDeliveryStore
 
 
 pytestmark = pytest.mark.integration
@@ -121,6 +121,7 @@ def test_schema_exposes_required_constraints_and_recent_index(engine):
     assert "ck_delivery_attempts_payload_sha256_length" in delivery_check_constraints
     assert "ck_delivery_attempts_installation_target_pair" in delivery_check_constraints
     assert "ix_delivery_attempts_recent" in delivery_indexes
+    assert "ix_delivery_attempts_diagnostics_keyset" in delivery_indexes
 
 
 def test_single_attempt_round_trips_all_domain_fields(engine):
@@ -234,6 +235,73 @@ def test_list_recent_uses_deterministic_recent_first_ordering(engine):
     assert [attempt.attempt_id for attempt in store.list_recent()] == [third.attempt_id, second.attempt_id]
 
 
+def test_list_attempts_page_uses_backend_neutral_keyset_ordering(engine):
+    store = PostgresDeliveryStore(engine)
+    shared_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    first = make_attempt("00000000-0000-0000-0000-000000000001", delivery_guid="delivery-001", received_at=shared_time)
+    second = make_attempt("00000000-0000-0000-0000-000000000002", delivery_guid="delivery-002", received_at=shared_time)
+    third = make_attempt(
+        "00000000-0000-0000-0000-000000000003",
+        delivery_guid="delivery-003",
+        received_at=shared_time + timedelta(seconds=1),
+    )
+    store.add(first)
+    store.add(second)
+    store.add(third)
+
+    first_page = store.list_attempts_page(limit=2)
+    second_page = store.list_attempts_page(
+        limit=2,
+        after=DeliveryAttemptKeyset(
+            received_at=first_page[-1].received_at,
+            attempt_id=first_page[-1].attempt_id,
+        ),
+    )
+
+    assert [attempt.attempt_id for attempt in first_page] == [third.attempt_id, second.attempt_id]
+    assert [attempt.attempt_id for attempt in second_page] == [first.attempt_id]
+
+
+def test_get_attempt_looks_up_by_attempt_id_only(engine):
+    store = PostgresDeliveryStore(engine)
+    first = make_attempt("00000000-0000-0000-0000-000000000001", delivery_guid="same-delivery")
+    second = make_attempt(
+        "00000000-0000-0000-0000-000000000002",
+        delivery_guid="same-delivery",
+        payload=b'{"action":"closed"}',
+        received_at=datetime(2026, 8, 24, 12, 1, tzinfo=timezone.utc),
+        action="closed",
+    )
+    store.add(first)
+    store.add(second)
+
+    assert store.get_attempt(first.attempt_id) == first
+    assert store.get_attempt(second.attempt_id) == second
+    assert store.get_attempt(UUID("00000000-0000-0000-0000-000000000003")) is None
+
+
+def test_memory_and_postgresql_attempt_page_ordering_match(engine):
+    postgres_store = PostgresDeliveryStore(engine)
+    memory_store = InMemoryDeliveryStore(max_events=10)
+    shared_time = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    attempts = [
+        make_attempt("00000000-0000-0000-0000-000000000001", delivery_guid="delivery-001", received_at=shared_time),
+        make_attempt("00000000-0000-0000-0000-000000000003", delivery_guid="delivery-003", received_at=shared_time),
+        make_attempt(
+            "00000000-0000-0000-0000-000000000002",
+            delivery_guid="delivery-002",
+            received_at=shared_time + timedelta(seconds=1),
+        ),
+    ]
+    for attempt in attempts:
+        postgres_store.add(attempt)
+        memory_store.add(attempt)
+
+    assert [attempt.attempt_id for attempt in postgres_store.list_attempts_page(limit=10)] == [
+        attempt.attempt_id for attempt in memory_store.list_attempts_page(limit=10)
+    ]
+
+
 def test_null_optional_metadata_round_trips(engine):
     store = PostgresDeliveryStore(engine)
     attempt = make_attempt(
@@ -304,6 +372,43 @@ def test_alembic_downgrade_removes_tables_and_reupgrade_restores_store(
         attempt = make_attempt("00000000-0000-0000-0000-000000000001")
         store.add(attempt)
         assert store.list_recent() == [attempt]
+    finally:
+        engine.dispose()
+
+
+def test_stage9_index_downgrade_removes_only_diagnostics_index_and_reupgrade_restores_it(
+    database_url: str,
+    alembic_config: Config,
+):
+    engine = create_engine(database_url, future=True)
+    try:
+        command.upgrade(alembic_config, "head")
+        inspector = inspect(engine)
+        assert "ix_delivery_attempts_diagnostics_keyset" in {
+            index["name"] for index in inspector.get_indexes("delivery_attempts")
+        }
+
+        command.downgrade(alembic_config, "20260824_0001")
+        inspector = inspect(engine)
+        assert {"github_deliveries", "delivery_attempts"}.issubset(set(inspector.get_table_names()))
+        delivery_indexes = {
+            index["name"]
+            for index in inspector.get_indexes("delivery_attempts")
+        }
+        assert "ix_delivery_attempts_recent" in delivery_indexes
+        assert "ix_delivery_attempts_diagnostics_keyset" not in delivery_indexes
+
+        command.upgrade(alembic_config, "head")
+        store = PostgresDeliveryStore(engine)
+        first = make_attempt("00000000-0000-0000-0000-000000000001")
+        second = make_attempt(
+            "00000000-0000-0000-0000-000000000002",
+            delivery_guid="delivery-002",
+            received_at=datetime(2026, 8, 24, 12, 1, tzinfo=timezone.utc),
+        )
+        store.add(first)
+        store.add(second)
+        assert [attempt.attempt_id for attempt in store.list_attempts_page(limit=1)] == [second.attempt_id]
     finally:
         engine.dispose()
 

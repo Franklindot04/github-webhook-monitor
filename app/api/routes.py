@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
+from app.api.v1.delivery_attempts import create_delivery_attempts_router
 from app.security import require_management_access
+from app.services.delivery_queries import DeliveryQueryService
 from app.services.webhooks import (
     InvalidWebhookSignatureError,
     MalformedWebhookPayloadError,
@@ -114,7 +116,18 @@ def create_router(
             raise HTTPException(status_code=503, detail="Service unavailable")
         return {"status": "ready"}
 
-    @router.get("/events", dependencies=[Depends(require_configured_management_access)])
+    router.include_router(
+        create_delivery_attempts_router(
+            query_service=DeliveryQueryService(delivery_store),
+            management_access_dependency=require_configured_management_access,
+        )
+    )
+
+    @router.get(
+        "/events",
+        dependencies=[Depends(require_configured_management_access)],
+        deprecated=True,
+    )
     async def get_events():
         try:
             recent_events = await run_in_threadpool(delivery_store.list_recent)

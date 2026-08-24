@@ -154,6 +154,100 @@ def test_http_webhook_persists_to_postgresql_and_events_reads_database(
         )
 
 
+def test_postgresql_runtime_v1_diagnostics_traverses_pages_and_survives_restart(
+    database_url: str,
+    engine,
+):
+    ingested_attempt_ids = []
+    with TestClient(create_app(settings=runtime_settings(database_url))) as first_client:
+        for index in range(4):
+            payload = encode_json(
+                {
+                    "action": f"event-{index}",
+                    "repository": {"full_name": f"octo/example-{index}"},
+                    "sender": {"login": f"octocat-{index}"},
+                }
+            )
+            response = post_webhook(first_client, payload, delivery_id=f"delivery-{index}")
+            assert response.status_code == 200
+            ingested_attempt_ids.append(response.json()["event"]["attempt_id"])
+
+        first_page_response = first_client.get(
+            "/api/v1/delivery-attempts?limit=2",
+            headers=management_headers(),
+        )
+        assert first_page_response.status_code == 200
+        first_page = first_page_response.json()
+        second_page_response = first_client.get(
+            f"/api/v1/delivery-attempts?limit=2&cursor={first_page['next_cursor']}",
+            headers=management_headers(),
+        )
+        assert second_page_response.status_code == 200
+        second_page = second_page_response.json()
+        detail_response = first_client.get(
+            f"/api/v1/delivery-attempts/{first_page['items'][0]['attempt_id']}",
+            headers=management_headers(),
+        )
+
+    assert detail_response.status_code == 200
+    traversed_attempt_ids = [item["attempt_id"] for item in first_page["items"] + second_page["items"]]
+    assert traversed_attempt_ids == list(reversed(ingested_attempt_ids))
+    assert len(traversed_attempt_ids) == len(set(traversed_attempt_ids))
+    assert second_page["next_cursor"] is None
+    assert detail_response.json()["attempt_id"] == first_page["items"][0]["attempt_id"]
+    assert "delivery_id" not in detail_response.json()
+    assert "raw_payload" not in detail_response.json()
+
+    with TestClient(create_app(settings=runtime_settings(database_url))) as second_client:
+        restart_response = second_client.get(
+            "/api/v1/delivery-attempts?limit=100",
+            headers=management_headers(),
+        )
+
+    assert restart_response.status_code == 200
+    assert [item["attempt_id"] for item in restart_response.json()["items"]] == traversed_attempt_ids
+    with engine.connect() as connection:
+        assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 4
+
+
+def test_postgresql_runtime_v1_pagination_is_stable_when_new_attempt_arrives_between_pages(
+    database_url: str,
+    engine,
+):
+    with TestClient(create_app(settings=runtime_settings(database_url))) as client:
+        original_attempt_ids = []
+        for index in range(4):
+            payload = encode_json({"action": f"event-{index}"})
+            response = post_webhook(client, payload, delivery_id=f"delivery-{index}")
+            assert response.status_code == 200
+            original_attempt_ids.append(response.json()["event"]["attempt_id"])
+
+        first_page_response = client.get(
+            "/api/v1/delivery-attempts?limit=2",
+            headers=management_headers(),
+        )
+        assert first_page_response.status_code == 200
+        first_page = first_page_response.json()
+
+        newer_payload = encode_json({"action": "newer"})
+        newer_response = post_webhook(client, newer_payload, delivery_id="delivery-newer")
+        assert newer_response.status_code == 200
+
+        second_page_response = client.get(
+            f"/api/v1/delivery-attempts?limit=2&cursor={first_page['next_cursor']}",
+            headers=management_headers(),
+        )
+        assert second_page_response.status_code == 200
+        second_page = second_page_response.json()
+
+    traversed_attempt_ids = [item["attempt_id"] for item in first_page["items"] + second_page["items"]]
+    assert traversed_attempt_ids == list(reversed(original_attempt_ids))
+    assert newer_response.json()["event"]["attempt_id"] not in traversed_attempt_ids
+    assert len(traversed_attempt_ids) == len(set(traversed_attempt_ids))
+    with engine.connect() as connection:
+        assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 5
+
+
 def test_postgresql_runtime_persists_events_across_application_restart(
     database_url: str,
     engine,
@@ -232,6 +326,11 @@ def test_postgresql_runtime_reports_service_unavailable_when_database_disappears
 
         post_response = post_webhook(client, payload)
         events_response = client.get("/events", headers=management_headers())
+        attempts_response = client.get("/api/v1/delivery-attempts", headers=management_headers())
+        attempt_response = client.get(
+            "/api/v1/delivery-attempts/00000000-0000-0000-0000-000000000001",
+            headers=management_headers(),
+        )
 
         unauthenticated_events_response = client.get("/events")
 
@@ -239,5 +338,9 @@ def test_postgresql_runtime_reports_service_unavailable_when_database_disappears
     assert post_response.json() == {"detail": "Service unavailable"}
     assert events_response.status_code == 503
     assert events_response.json() == {"detail": "Service unavailable"}
+    assert attempts_response.status_code == 503
+    assert attempts_response.json() == {"detail": "Service unavailable"}
+    assert attempt_response.status_code == 503
+    assert attempt_response.json() == {"detail": "Service unavailable"}
     assert unauthenticated_events_response.status_code == 401
     command.upgrade(alembic_config, "head")
