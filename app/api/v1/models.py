@@ -51,8 +51,30 @@ class GitHubDeliveriesReconciliationResponse(BaseModel):
 
 
 class GitHubRedeliveryResponse(BaseModel):
+    action_id: UUID
     attempt_id: UUID
     delivery_guid: str
     hook_id: int
     github_delivery_id: int
     status: str
+
+
+class RecoveryActionResponse(BaseModel):
+    action_id: UUID
+    action_type: str
+    requested_at: datetime
+    completed_at: datetime | None
+    attempt_id: UUID
+    delivery_guid: str
+    hook_id: int
+    repository: str
+    github_delivery_id: int
+    authentication_method: str
+    state: str
+    upstream_status_code: int | None
+    failure_category: str | None
+
+
+class RecoveryActionsListResponse(BaseModel):
+    items: list[RecoveryActionResponse]
+    next_cursor: str | None

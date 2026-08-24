@@ -9,12 +9,13 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, func, inspect, select, text
 
 from app.config import Settings
 from app.factory import create_app
+from app.integrations.github.client import GitHubRedeliveryOutcomeUnknownError, GitHubUpstreamProtocolError
 from app.integrations.github.models import GitHubDeliveryPage, GitHubDeliverySummary
-from app.persistence.schema import delivery_attempts, github_deliveries
+from app.persistence.schema import delivery_attempts, github_deliveries, recovery_actions
 from app.storage.deliveries import DeliveryStoreReadinessError
 
 
@@ -49,7 +50,8 @@ class RecordingGitHubDeliveryClient:
 
 
 class RecordingGitHubRedeliveryClient:
-    def __init__(self):
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc
         self.calls = []
 
     async def request_repository_webhook_redelivery(self, *, owner, repository, hook_id, github_delivery_id):
@@ -61,6 +63,8 @@ class RecordingGitHubRedeliveryClient:
                 "github_delivery_id": github_delivery_id,
             }
         )
+        if self.exc is not None:
+            raise self.exc
 
     async def aclose(self):
         pass
@@ -115,6 +119,7 @@ def engine(database_url: str, alembic_config: Config):
 
 def clean_tables(engine) -> None:
     with engine.begin() as connection:
+        connection.execute(recovery_actions.delete())
         connection.execute(delivery_attempts.delete())
         connection.execute(github_deliveries.delete())
 
@@ -215,6 +220,42 @@ def test_postgresql_runtime_startup_requires_migrated_schema(
             pass
 
     command.upgrade(alembic_config, "head")
+
+
+def test_postgresql_stage12_migration_lifecycle_preserves_delivery_schema(
+    database_url: str,
+    alembic_config: Config,
+):
+    command.upgrade(alembic_config, "head")
+    command.downgrade(alembic_config, "20260824_0002")
+    engine = create_engine(database_url, future=True)
+    try:
+        inspector = inspect(engine)
+        assert "recovery_actions" not in inspector.get_table_names()
+        assert "delivery_attempts" in inspector.get_table_names()
+        assert "github_deliveries" in inspector.get_table_names()
+
+        with pytest.raises(DeliveryStoreReadinessError):
+            with TestClient(create_app(settings=runtime_settings(database_url))):
+                pass
+
+        command.upgrade(alembic_config, "head")
+        inspector = inspect(engine)
+        assert "recovery_actions" in inspector.get_table_names()
+        recovery_indexes = {index["name"] for index in inspector.get_indexes("recovery_actions")}
+        assert "ix_recovery_actions_recent" in recovery_indexes
+        with TestClient(create_app(settings=runtime_settings(database_url))) as client:
+            assert client.get("/ready").status_code == 200
+
+        command.downgrade(alembic_config, "20260824_0002")
+        inspector = inspect(engine)
+        assert "recovery_actions" not in inspector.get_table_names()
+        assert "delivery_attempts" in inspector.get_table_names()
+        assert "github_deliveries" in inspector.get_table_names()
+
+        command.upgrade(alembic_config, "head")
+    finally:
+        engine.dispose()
     with TestClient(create_app(settings=runtime_settings(database_url))) as client:
         assert client.get("/ready").status_code == 200
 
@@ -473,6 +514,7 @@ def test_postgresql_runtime_accepts_verified_github_redelivery_without_fabricati
 
     assert redelivery_response.status_code == 202
     assert redelivery_response.json() == {
+        "action_id": redelivery_response.json()["action_id"],
         "attempt_id": attempt_id,
         "delivery_guid": "delivery-001",
         "hook_id": 12345,
@@ -487,6 +529,121 @@ def test_postgresql_runtime_accepts_verified_github_redelivery_without_fabricati
     ]
     with engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 1
+        assert connection.execute(select(func.count()).select_from(recovery_actions)).scalar_one() == 1
+        action = connection.execute(select(recovery_actions)).mappings().one()
+    assert str(action["action_id"]) == redelivery_response.json()["action_id"]
+    assert action["state"] == "accepted"
+    assert action["authentication_method"] == "management_bearer"
+    assert action["completed_at"] is not None
+
+
+def test_postgresql_runtime_persists_recovery_action_across_application_restart(
+    database_url: str,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient()
+    payload = encode_json({"repository": {"full_name": "octo/example"}})
+
+    with TestClient(
+        create_app(
+            settings=redelivery_runtime_settings(database_url),
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
+        )
+    ) as first_client:
+        webhook_response = post_webhook(first_client, payload)
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        redelivery_response = first_client.post(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+            headers=management_headers(),
+        )
+        action_id = redelivery_response.json()["action_id"]
+
+    with TestClient(create_app(settings=redelivery_runtime_settings(database_url))) as second_client:
+        action_response = second_client.get(f"/api/v1/recovery-actions/{action_id}", headers=management_headers())
+
+    assert action_response.status_code == 200
+    assert action_response.json()["state"] == "accepted"
+    assert action_response.json()["action_id"] == action_id
+
+
+def test_postgresql_runtime_records_failed_redelivery_action_without_raw_body(
+    database_url: str,
+    engine,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient(
+        exc=GitHubUpstreamProtocolError(
+            "hidden upstream body",
+            status_code=403,
+            failure_category="upstream_permission",
+        )
+    )
+    payload = encode_json({"repository": {"full_name": "octo/example"}})
+
+    with TestClient(
+        create_app(
+            settings=redelivery_runtime_settings(database_url),
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
+        )
+    ) as client:
+        webhook_response = post_webhook(client, payload)
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        response = client.post(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+            headers=management_headers(),
+        )
+
+    assert response.status_code == 502
+    assert "hidden upstream body" not in response.text
+    assert github_redelivery_client.calls == [
+        {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 100}
+    ]
+    with engine.connect() as connection:
+        action = connection.execute(select(recovery_actions)).mappings().one()
+        assert connection.execute(select(func.count()).select_from(delivery_attempts)).scalar_one() == 1
+    assert action["state"] == "failed"
+    assert action["upstream_status_code"] == 403
+    assert action["failure_category"] == "upstream_permission"
+
+
+def test_postgresql_runtime_records_outcome_unknown_redelivery_action(
+    database_url: str,
+    engine,
+):
+    github_client = RecordingGitHubDeliveryClient(
+        [GitHubDeliveryPage(deliveries=[make_github_delivery(100)], next_cursor=None)]
+    )
+    github_redelivery_client = RecordingGitHubRedeliveryClient(
+        exc=GitHubRedeliveryOutcomeUnknownError("synthetic ambiguous timeout")
+    )
+    payload = encode_json({"repository": {"full_name": "octo/example"}})
+
+    with TestClient(
+        create_app(
+            settings=redelivery_runtime_settings(database_url),
+            github_delivery_client=github_client,
+            github_redelivery_client=github_redelivery_client,
+        )
+    ) as client:
+        webhook_response = post_webhook(client, payload)
+        attempt_id = webhook_response.json()["event"]["attempt_id"]
+        response = client.post(
+            f"/api/v1/delivery-attempts/{attempt_id}/github-deliveries/100/redelivery",
+            headers=management_headers(),
+        )
+
+    assert response.status_code == 503
+    assert len(github_redelivery_client.calls) == 1
+    with engine.connect() as connection:
+        action = connection.execute(select(recovery_actions)).mappings().one()
+    assert action["state"] == "outcome_unknown"
+    assert action["failure_category"] == "outcome_unknown"
 
 
 def test_postgresql_runtime_later_same_guid_ingress_after_redelivery_uses_normal_webhook_path(

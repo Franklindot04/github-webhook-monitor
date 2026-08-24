@@ -119,6 +119,8 @@ Once the server is running, you can open:
 | GET | `/api/v1/delivery-attempts/{attempt_id}` | Preferred management diagnostics endpoint for one delivery attempt |
 | GET | `/api/v1/delivery-attempts/{attempt_id}/github-deliveries` | Management endpoint for read-only GitHub repository-webhook delivery reconciliation |
 | POST | `/api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery` | Management endpoint for verified GitHub repository-webhook redelivery requests |
+| GET | `/api/v1/recovery-actions` | Management endpoint for paginated recovery-action journal inspection |
+| GET | `/api/v1/recovery-actions/{action_id}` | Management endpoint for one recovery-action journal entry |
 | GET | `/events` | Deprecated compatibility endpoint for recent stored webhook delivery attempt summaries |
 | POST | `/webhook/github` | Receives and validates GitHub webhook deliveries |
 
@@ -139,6 +141,8 @@ Management plane:
 - `GET /api/v1/delivery-attempts/{attempt_id}`
 - `GET /api/v1/delivery-attempts/{attempt_id}/github-deliveries`
 - `POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_id}/redelivery`
+- `GET /api/v1/recovery-actions`
+- `GET /api/v1/recovery-actions/{action_id}`
 - `GET /events`
 
 ## Local webhook test
@@ -417,11 +421,42 @@ POST /api/v1/delivery-attempts/{attempt_id}/github-deliveries/{github_delivery_i
 
 The endpoint starts from a local `attempt_id`, validates repository webhook coordinates, performs a bounded read-only reconciliation search, and mutates only when the selected `github_delivery_id` is found with the same local `delivery_guid`. It does not trust an arbitrary caller-supplied upstream ID and does not call GitHub's delivery-detail endpoint.
 
-On success the endpoint returns `202 Accepted`, meaning GitHub accepted the redelivery request. It does not mean the webhook has already been delivered, processed, or recorded locally. The local delivery ledger is updated only when GitHub later sends a webhook to `POST /webhook/github` and normal ingress authenticates and stores that receiver observation.
+On success the endpoint returns `202 Accepted` with an application-owned `action_id`, meaning GitHub accepted that recovery action's redelivery request. It does not mean the webhook has already been delivered, processed, or recorded locally. The local delivery ledger is updated only when GitHub later sends a webhook to `POST /webhook/github` and normal ingress authenticates and stores that receiver observation.
 
-The redelivery action does not create a local `DeliveryAttempt`, does not mark an existing attempt as retried or redelivered, does not persist upstream action state, and does not add replay or idempotency semantics. Repeating the management `POST` can request additional GitHub redeliveries. If the POST outcome cannot be confirmed because of a timeout or ambiguous transport failure, operators should reconcile GitHub delivery history before deciding whether to retry manually.
+The redelivery action does not create a local `DeliveryAttempt`, does not mark an existing attempt as retried or redelivered, does not persist upstream delivery-history records, and does not add replay or idempotency semantics. Repeating the management `POST` can request additional GitHub redeliveries. If the POST outcome cannot be confirmed because of a timeout or ambiguous transport failure, operators should reconcile GitHub delivery history before deciding whether to retry manually.
 
 Stage 11 does not add automatic retries, backoff, queues, workers, GitHub App redelivery, organization webhook redelivery, Enterprise host support, or upstream payload retrieval.
+
+## Recovery action journal
+
+The recovery action journal records privileged control-plane intent and outcome separately from webhook receipt observations. A `DeliveryAttempt` says what this receiver observed; a GitHub upstream delivery record says what GitHub reports in repository webhook history; a recovery action says what authenticated management action this application attempted.
+
+For controlled repository-webhook redelivery, the application validates the local attempt, repository target, and exact upstream `github_delivery_id` first. It then writes an initiated recovery action before the GitHub mutation POST. If that journal write fails, the GitHub mutation is not sent. After the single POST attempt, the action is finalized as `accepted`, `failed`, or `outcome_unknown`.
+
+Journal entries expose an application-owned `action_id`, action type `github_repository_webhook_redelivery`, timestamps, target snapshot fields, authentication method, state, optional upstream status code, and a bounded failure category. They do not expose database surrogate IDs, tokens, webhook secrets, raw webhook bodies, authorization headers, raw GitHub error responses, or GitHub stored webhook payloads.
+
+Terminal states are intentionally conservative:
+
+- `accepted`: GitHub returned `202 Accepted` for the redelivery request.
+- `failed`: GitHub returned a definite classified failure.
+- `outcome_unknown`: the POST submission result could not be safely confirmed.
+
+An `initiated` action without a terminal state means the management intent was durably recorded, but finalization did not complete; investigate by reviewing local journal state and reconciling GitHub delivery history before deciding on any manual follow-up. The application does not automatically retry the GitHub POST or journal finalization.
+
+Each authenticated management POST is a distinct action with a distinct `action_id`. The journal does not introduce idempotency or deduplication, and repeated operator actions can request additional redeliveries.
+
+PostgreSQL runtime persists recovery-action history across application restarts. Memory runtime keeps a non-durable in-process journal for local runtime behavior and tests; it does not survive restart. Production-grade durable action history requires PostgreSQL runtime.
+
+The current management bearer authenticates access but does not provide per-human operator identity. The journal can prove an authenticated management action occurred; it cannot yet prove which individual person performed it. Individual operator identity and role-based authorization remain deferred.
+
+Read-only journal endpoints are management-authenticated:
+
+```text
+GET /api/v1/recovery-actions
+GET /api/v1/recovery-actions/{action_id}
+```
+
+Journal pagination uses recent-first keyset ordering by `requested_at DESC, action_id DESC`, `limit` bounds `1..100`, and opaque cursors. It does not use offset pagination or return a total count.
 
 ## Repository files
 

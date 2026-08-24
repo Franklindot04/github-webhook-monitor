@@ -14,7 +14,16 @@ REPOSITORY_DELIVERIES_PER_PAGE = 100
 
 
 class GitHubUpstreamError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        failure_category: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.failure_category = failure_category
 
 
 class GitHubUpstreamUnavailableError(GitHubUpstreamError):
@@ -130,9 +139,23 @@ class GitHubRepositoryWebhookRedeliveryClient:
 
         if response.status_code == 202:
             return
-        if response.status_code == 429 or response.status_code >= 500 or _is_rate_limited(response):
-            raise GitHubUpstreamUnavailableError("GitHub upstream unavailable")
-        raise GitHubUpstreamProtocolError("GitHub upstream request failed")
+        if response.status_code == 429 or _is_rate_limited(response):
+            raise GitHubUpstreamUnavailableError(
+                "GitHub upstream unavailable",
+                status_code=response.status_code,
+                failure_category="upstream_throttled",
+            )
+        if response.status_code >= 500:
+            raise GitHubUpstreamUnavailableError(
+                "GitHub upstream unavailable",
+                status_code=response.status_code,
+                failure_category="upstream_unavailable",
+            )
+        raise GitHubUpstreamProtocolError(
+            "GitHub upstream request failed",
+            status_code=response.status_code,
+            failure_category=_redelivery_protocol_failure_category(response.status_code),
+        )
 
 
 def github_headers(token: str) -> dict[str, str]:
@@ -170,6 +193,14 @@ def _is_rate_limited(response: httpx2.Response) -> bool:
     if response.headers.get("retry-after") is not None:
         return True
     return response.headers.get("x-ratelimit-remaining", "").strip() == "0"
+
+
+def _redelivery_protocol_failure_category(status_code: int) -> str:
+    if status_code == 401:
+        return "upstream_auth"
+    if status_code == 403:
+        return "upstream_permission"
+    return "upstream_protocol"
 
 
 def extract_next_cursor(link_header: str | None, *, expected_path: str) -> str | None:

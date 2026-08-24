@@ -6,19 +6,21 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings
 from app.persistence.database import create_database_engine
-from app.persistence.postgres import PostgresDeliveryStore
-from app.persistence.schema import delivery_attempts, github_deliveries
+from app.persistence.postgres import PostgresDeliveryStore, PostgresRecoveryActionStore
+from app.persistence.schema import delivery_attempts, github_deliveries, recovery_actions
 from app.storage.deliveries import (
     DeliveryStore,
     DeliveryStoreError,
     DeliveryStoreReadinessError,
     InMemoryDeliveryStore,
 )
+from app.storage.recovery_actions import InMemoryRecoveryActionStore, RecoveryActionStore
 
 
 @dataclass(frozen=True)
 class RuntimeResources:
     delivery_store: DeliveryStore
+    recovery_action_store: RecoveryActionStore
     readiness_check: Callable[[], None]
     engine: Engine | None = None
     owns_engine: bool = False
@@ -28,6 +30,7 @@ def build_runtime_resources(settings: Settings) -> RuntimeResources:
     if settings.delivery_store_backend == "memory":
         return RuntimeResources(
             delivery_store=InMemoryDeliveryStore(max_events=settings.max_events),
+            recovery_action_store=InMemoryRecoveryActionStore(max_actions=settings.max_events),
             readiness_check=memory_readiness_check,
         )
 
@@ -41,6 +44,7 @@ def build_runtime_resources(settings: Settings) -> RuntimeResources:
     )
     return RuntimeResources(
         delivery_store=PostgresDeliveryStore(engine, list_limit=settings.max_events),
+        recovery_action_store=PostgresRecoveryActionStore(engine),
         readiness_check=lambda: verify_delivery_store_ready(engine),
         engine=engine,
         owns_engine=True,
@@ -71,12 +75,26 @@ def verify_delivery_store_ready(engine: Engine) -> None:
                     delivery_attempts.c.sender,
                     delivery_attempts.c.installation_target_id,
                     delivery_attempts.c.installation_target_type,
+                    recovery_actions.c.id,
+                    recovery_actions.c.action_id,
+                    recovery_actions.c.action_type,
+                    recovery_actions.c.requested_at,
+                    recovery_actions.c.completed_at,
+                    recovery_actions.c.attempt_id,
+                    recovery_actions.c.delivery_guid,
+                    recovery_actions.c.hook_id,
+                    recovery_actions.c.repository,
+                    recovery_actions.c.github_delivery_id,
+                    recovery_actions.c.authentication_method,
+                    recovery_actions.c.state,
+                    recovery_actions.c.upstream_status_code,
+                    recovery_actions.c.failure_category,
                 )
                 .select_from(
                     delivery_attempts.join(
                         github_deliveries,
                         delivery_attempts.c.github_delivery_id == github_deliveries.c.id,
-                    )
+                    ).outerjoin(recovery_actions, recovery_actions.c.attempt_id == delivery_attempts.c.attempt_id)
                 )
                 .limit(0)
             )

@@ -9,8 +9,11 @@ from app.api.v1.models import (
     GitHubDeliveriesReconciliationResponse,
     GitHubDeliverySummaryResponse,
     GitHubRedeliveryResponse,
+    RecoveryActionResponse,
+    RecoveryActionsListResponse,
 )
 from app.domain.deliveries import DeliveryAttempt
+from app.domain.recovery_actions import RecoveryAction
 from app.integrations.github.models import GitHubDeliverySummary
 from app.services.delivery_queries import (
     DeliveryQueryService,
@@ -28,11 +31,19 @@ from app.services.github_reconciliation import (
 )
 from app.services.github_redelivery import (
     GitHubRedeliveryDisabledError,
+    GitHubRedeliveryJournalUnavailableError,
     GitHubRedeliveryOutcomeUnknownError,
     GitHubRedeliveryService,
     UnverifiedGitHubRedeliveryTargetError,
 )
+from app.services.recovery_actions import (
+    InvalidRecoveryActionsCursorError,
+    InvalidRecoveryActionsLimitError,
+    RecoveryActionQueryService,
+    parse_recovery_actions_limit,
+)
 from app.storage.deliveries import DeliveryStoreError
+from app.storage.recovery_actions import RecoveryActionStoreError
 
 
 def delivery_attempt_to_response(attempt: DeliveryAttempt) -> DeliveryAttemptResponse:
@@ -68,11 +79,30 @@ def github_delivery_to_response(delivery: GitHubDeliverySummary) -> GitHubDelive
     )
 
 
+def recovery_action_to_response(action: RecoveryAction) -> RecoveryActionResponse:
+    return RecoveryActionResponse(
+        action_id=action.action_id,
+        action_type=action.action_type,
+        requested_at=action.requested_at,
+        completed_at=action.completed_at,
+        attempt_id=action.attempt_id,
+        delivery_guid=action.delivery_guid,
+        hook_id=action.hook_id,
+        repository=action.repository,
+        github_delivery_id=action.github_delivery_id,
+        authentication_method=action.authentication_method,
+        state=action.state,
+        upstream_status_code=action.upstream_status_code,
+        failure_category=action.failure_category,
+    )
+
+
 def create_delivery_attempts_router(
     query_service: DeliveryQueryService,
     management_access_dependency,
     reconciliation_service: GitHubReconciliationService | None = None,
     redelivery_service: GitHubRedeliveryService | None = None,
+    recovery_action_query_service: RecoveryActionQueryService | None = None,
 ) -> APIRouter:
     router = APIRouter(
         prefix="/api/v1",
@@ -230,6 +260,8 @@ def create_delivery_attempts_router(
             )
         except GitHubRedeliveryDisabledError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        except GitHubRedeliveryJournalUnavailableError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable")
         except UnsupportedGitHubReconciliationTargetError:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -251,11 +283,66 @@ def create_delivery_attempts_router(
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Upstream service unavailable")
 
         return GitHubRedeliveryResponse(
+            action_id=result.action_id,
             attempt_id=result.attempt.attempt_id,
             delivery_guid=result.attempt.delivery_identity.delivery_guid,
             hook_id=result.attempt.delivery_identity.hook_id,
             github_delivery_id=result.github_delivery_id,
             status=result.status,
         )
+
+    @router.get("/recovery-actions", response_model=RecoveryActionsListResponse)
+    async def list_recovery_actions(
+        limit: str | None = Query(
+            default=None,
+            description="Page size as an integer from 1 to 100. Defaults to 50.",
+        ),
+        cursor: str | None = Query(
+            default=None,
+            description="Opaque recovery-action pagination cursor returned as next_cursor. Do not parse or construct.",
+        ),
+    ):
+        if recovery_action_query_service is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        try:
+            parsed_limit = parse_recovery_actions_limit(limit)
+            page = await run_in_threadpool(
+                recovery_action_query_service.list_actions,
+                limit=parsed_limit,
+                cursor=cursor,
+            )
+        except InvalidRecoveryActionsLimitError:
+            raise HTTPException(status_code=422, detail="Invalid limit")
+        except InvalidRecoveryActionsCursorError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired cursor")
+        except RecoveryActionStoreError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable")
+
+        return RecoveryActionsListResponse(
+            items=[recovery_action_to_response(action) for action in page.items],
+            next_cursor=page.next_cursor,
+        )
+
+    @router.get("/recovery-actions/{action_id}", response_model=RecoveryActionResponse)
+    async def get_recovery_action(
+        action_id: str = Path(
+            description="Application-owned recovery action UUID.",
+            json_schema_extra={"format": "uuid"},
+        ),
+    ):
+        if recovery_action_query_service is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        try:
+            parsed_action_id = UUID(action_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid action_id")
+
+        try:
+            action = await run_in_threadpool(recovery_action_query_service.get_action, parsed_action_id)
+        except RecoveryActionStoreError:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable")
+        if action is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recovery action not found")
+        return recovery_action_to_response(action)
 
     return router
