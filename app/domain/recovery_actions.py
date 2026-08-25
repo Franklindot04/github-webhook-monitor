@@ -43,6 +43,8 @@ class RecoveryAction:
     principal_issuer: str | None
     principal_subject: str | None
     principal_client_id: str | None
+    authorization_capability: str | None
+    authorization_scope: str | None
     state: str
     upstream_status_code: int | None
     failure_category: str | None

@@ -4,6 +4,12 @@ from uuid import UUID
 import pytest
 
 from app.domain.deliveries import DeliveryAttempt, GitHubDeliveryIdentity
+from app.domain.management import (
+    AUTHORIZATION_METHOD_SHARED_MANAGEMENT_TOKEN,
+    MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE,
+    SHARED_TOKEN_PRINCIPAL,
+    ManagementAuthorization,
+)
 from app.integrations.github.models import GitHubDeliveryPage, GitHubDeliverySummary
 from app.services.delivery_queries import DeliveryQueryService
 from app.services.github_reconciliation import (
@@ -20,6 +26,14 @@ from app.storage.recovery_actions import InMemoryRecoveryActionStore, RecoveryAc
 
 
 ATTEMPT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+
+SHARED_EXECUTE_AUTHORIZATION = ManagementAuthorization(
+    principal=SHARED_TOKEN_PRINCIPAL,
+    capability=MANAGEMENT_CAPABILITY_RECOVERY_EXECUTE,
+    authorization_method=AUTHORIZATION_METHOD_SHARED_MANAGEMENT_TOKEN,
+    matched_scope=None,
+)
 
 
 def make_attempt(
@@ -159,7 +173,11 @@ async def test_unsupported_repository_target_fails_before_upstream_calls(attempt
     service = service_with_store(store, github_delivery_client, github_redelivery_client)
 
     with pytest.raises(UnsupportedGitHubReconciliationTargetError):
-        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+        await service.request_redelivery(
+            attempt=attempt,
+            github_delivery_id=100,
+            authorization=SHARED_EXECUTE_AUTHORIZATION,
+        )
 
     assert github_delivery_client.calls == []
     assert github_redelivery_client.calls == []
@@ -183,7 +201,11 @@ async def test_unverified_github_delivery_id_does_not_mutate(page):
     service = service_with_store(store, github_delivery_client, github_redelivery_client, max_pages=1)
 
     with pytest.raises(UnverifiedGitHubRedeliveryTargetError):
-        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+        await service.request_redelivery(
+            attempt=attempt,
+            github_delivery_id=100,
+            authorization=SHARED_EXECUTE_AUTHORIZATION,
+        )
 
     assert len(github_delivery_client.calls) == 1
     assert github_redelivery_client.calls == []
@@ -200,7 +222,11 @@ async def test_verified_upstream_target_requests_one_redelivery():
     github_redelivery_client = RecordingGitHubRedeliveryClient()
     service = service_with_store(store, github_delivery_client, github_redelivery_client)
 
-    result = await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+    result = await service.request_redelivery(
+        attempt=attempt,
+        github_delivery_id=100,
+        authorization=SHARED_EXECUTE_AUTHORIZATION,
+    )
 
     assert result.status == "accepted"
     assert result.action_id
@@ -232,7 +258,11 @@ async def test_journal_create_failure_prevents_mutation():
     )
 
     with pytest.raises(GitHubRedeliveryJournalUnavailableError):
-        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+        await service.request_redelivery(
+            attempt=attempt,
+            github_delivery_id=100,
+            authorization=SHARED_EXECUTE_AUTHORIZATION,
+        )
 
     assert len(github_delivery_client.calls) == 1
     assert github_redelivery_client.calls == []
@@ -256,7 +286,11 @@ async def test_journal_finalize_failure_does_not_repeat_mutation():
     )
 
     with pytest.raises(GitHubRedeliveryJournalUnavailableError):
-        await service.request_redelivery(attempt=attempt, github_delivery_id=100)
+        await service.request_redelivery(
+            attempt=attempt,
+            github_delivery_id=100,
+            authorization=SHARED_EXECUTE_AUTHORIZATION,
+        )
 
     assert github_redelivery_client.calls == [
         {"owner": "octo", "repository": "example", "hook_id": 12345, "github_delivery_id": 100}
@@ -283,7 +317,11 @@ async def test_multiple_same_guid_records_mutate_exact_requested_id():
     github_redelivery_client = RecordingGitHubRedeliveryClient()
     service = service_with_store(store, github_delivery_client, github_redelivery_client)
 
-    result = await service.request_redelivery(attempt=attempt, github_delivery_id=101)
+    result = await service.request_redelivery(
+        attempt=attempt,
+        github_delivery_id=101,
+        authorization=SHARED_EXECUTE_AUTHORIZATION,
+    )
 
     assert result.github_delivery_id == 101
     assert github_redelivery_client.calls == [

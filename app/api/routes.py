@@ -5,12 +5,18 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.delivery_attempts import create_delivery_attempts_router
-from app.domain.management import ManagementPrincipal
+from app.domain.management import (
+    MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ,
+    ManagementAuthorization,
+    ManagementPrincipal,
+    ManagementScopePolicy,
+)
 from app.security import (
     InsufficientManagementScopeError,
     InvalidManagementTokenError,
     ManagementIdentityProviderUnavailableError,
     OidcJwtManagementAuthenticator,
+    authorize_management_capability,
     authenticate_shared_management_token,
     management_forbidden,
     management_identity_unavailable,
@@ -106,6 +112,7 @@ def create_router(
     management_api_enabled: bool,
     management_api_token: str | None,
     management_auth_mode: str = "shared_token",
+    management_scope_policy: ManagementScopePolicy | None = None,
     oidc_management_authenticator: OidcJwtManagementAuthenticator | None = None,
     github_reconciliation_service: GitHubReconciliationService | None = None,
     github_redelivery_service: GitHubRedeliveryService | None = None,
@@ -134,6 +141,24 @@ def create_router(
         except ManagementIdentityProviderUnavailableError:
             raise management_identity_unavailable()
 
+    if management_scope_policy is None:
+        raise ValueError("management_scope_policy is required")
+
+    def require_management_capability(capability: str):
+        async def dependency(
+            principal: ManagementPrincipal = Depends(require_configured_management_access),
+        ) -> ManagementAuthorization:
+            try:
+                return authorize_management_capability(
+                    principal=principal,
+                    capability=capability,
+                    scope_policy=management_scope_policy,
+                )
+            except InsufficientManagementScopeError:
+                raise management_forbidden(management_scope_policy.scope_for(capability))
+
+        return dependency
+
     @router.get("/health")
     def health():
         return {"status": "ok"}
@@ -150,6 +175,7 @@ def create_router(
         create_delivery_attempts_router(
             query_service=DeliveryQueryService(delivery_store),
             management_access_dependency=require_configured_management_access,
+            management_capability_dependency=require_management_capability,
             reconciliation_service=github_reconciliation_service,
             redelivery_service=github_redelivery_service,
             recovery_action_query_service=recovery_action_query_service,
@@ -158,10 +184,15 @@ def create_router(
 
     @router.get(
         "/events",
-        dependencies=[Depends(require_configured_management_access)],
         deprecated=True,
+        description="Requires management capability diagnostics.read.",
+        responses={403: {"description": "Authenticated principal lacks the required management capability."}},
     )
-    async def get_events():
+    async def get_events(
+        _authorization: ManagementAuthorization = Depends(
+            require_management_capability(MANAGEMENT_CAPABILITY_DIAGNOSTICS_READ)
+        ),
+    ):
         try:
             recent_events = await run_in_threadpool(delivery_store.list_recent)
         except DeliveryStoreError:

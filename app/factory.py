@@ -10,6 +10,7 @@ from app.integrations.github.client import (
     GitHubRepositoryWebhookDeliveriesClient,
     GitHubRepositoryWebhookRedeliveryClient,
 )
+from app.domain.management import ManagementScopePolicy
 from app.runtime import RuntimeResources, build_runtime_resources
 from app.security import OidcJwtConfig, OidcJwtManagementAuthenticator, parse_allowed_jwt_algorithms
 from app.services.delivery_queries import DeliveryQueryService
@@ -92,11 +93,16 @@ def create_app(
             config=OidcJwtConfig(
                 issuer=app_settings.management_oidc_issuer,
                 audience=app_settings.management_oidc_audience,
-                required_scope=app_settings.management_oidc_required_scope,
                 allowed_algorithms=parse_allowed_jwt_algorithms(app_settings.management_oidc_allowed_algorithms),
             ),
             http_client=app_management_identity_http_client,
         )
+    app_management_scope_policy = ManagementScopePolicy(
+        full_management_scope=app_settings.management_oidc_full_management_scope,
+        diagnostics_read_scope=app_settings.management_oidc_diagnostics_read_scope,
+        recovery_read_scope=app_settings.management_oidc_recovery_read_scope,
+        recovery_execute_scope=app_settings.management_oidc_recovery_execute_scope,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -138,6 +144,7 @@ def create_app(
                 else None
             ),
             management_auth_mode=app_settings.management_auth_mode,
+            management_scope_policy=app_management_scope_policy,
             oidc_management_authenticator=app_oidc_authenticator,
             github_reconciliation_service=app_github_reconciliation_service,
             github_redelivery_service=app_github_redelivery_service,

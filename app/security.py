@@ -13,8 +13,14 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from app.domain.management import (
     AUTHENTICATION_METHOD_OIDC_JWT,
+    AUTHENTICATION_METHOD_MANAGEMENT_BEARER,
+    AUTHORIZATION_METHOD_OIDC_SCOPE,
+    AUTHORIZATION_METHOD_SHARED_MANAGEMENT_TOKEN,
+    MANAGEMENT_CAPABILITIES,
     SHARED_TOKEN_PRINCIPAL,
+    ManagementAuthorization,
     ManagementPrincipal,
+    ManagementScopePolicy,
 )
 
 
@@ -43,7 +49,6 @@ class InsufficientManagementScopeError(Exception):
 class OidcJwtConfig:
     issuer: str
     audience: str
-    required_scope: str
     allowed_algorithms: tuple[str, ...]
 
 
@@ -113,8 +118,15 @@ def management_unauthorized() -> HTTPException:
     )
 
 
-def management_forbidden() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MANAGEMENT_FORBIDDEN_DETAIL)
+def management_forbidden(required_scope: str | None = None) -> HTTPException:
+    headers = None
+    if required_scope is not None:
+        headers = {"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{required_scope}"'}
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=MANAGEMENT_FORBIDDEN_DETAIL,
+        headers=headers,
+    )
 
 
 def management_identity_unavailable() -> HTTPException:
@@ -187,8 +199,6 @@ class OidcJwtManagementAuthenticator:
         if not isinstance(jwt_id, str) or not jwt_id.strip():
             raise InvalidManagementTokenError("Missing JWT id")
         scopes = parse_scope_claim(claims.get("scope"))
-        if self._config.required_scope not in scopes:
-            raise InsufficientManagementScopeError("Missing required management scope")
         return ManagementPrincipal(
             authentication_method=AUTHENTICATION_METHOD_OIDC_JWT,
             issuer=self._config.issuer,
@@ -276,11 +286,45 @@ class OidcJwtManagementAuthenticator:
 
 
 def parse_scope_claim(value: object) -> set[str]:
-    if value is None:
-        return set()
     if not isinstance(value, str):
         raise InvalidManagementTokenError("Invalid scope")
     return {scope for scope in value.split() if scope}
+
+
+def authorize_management_capability(
+    *,
+    principal: ManagementPrincipal,
+    capability: str,
+    scope_policy: ManagementScopePolicy,
+) -> ManagementAuthorization:
+    if capability not in MANAGEMENT_CAPABILITIES:
+        raise ValueError("Unknown management capability")
+    if principal.authentication_method == AUTHENTICATION_METHOD_MANAGEMENT_BEARER:
+        return ManagementAuthorization(
+            principal=principal,
+            capability=capability,
+            authorization_method=AUTHORIZATION_METHOD_SHARED_MANAGEMENT_TOKEN,
+            matched_scope=None,
+        )
+    if principal.authentication_method != AUTHENTICATION_METHOD_OIDC_JWT:
+        raise InsufficientManagementScopeError("Unsupported management authentication method")
+
+    required_scope = scope_policy.scope_for(capability)
+    if required_scope in principal.scopes:
+        return ManagementAuthorization(
+            principal=principal,
+            capability=capability,
+            authorization_method=AUTHORIZATION_METHOD_OIDC_SCOPE,
+            matched_scope=required_scope,
+        )
+    if scope_policy.full_management_scope in principal.scopes:
+        return ManagementAuthorization(
+            principal=principal,
+            capability=capability,
+            authorization_method=AUTHORIZATION_METHOD_OIDC_SCOPE,
+            matched_scope=scope_policy.full_management_scope,
+        )
+    raise InsufficientManagementScopeError("Missing required management capability scope")
 
 
 def parse_allowed_jwt_algorithms(value: str | Sequence[str]) -> tuple[str, ...]:
